@@ -53,7 +53,7 @@ The agent asks for a link, you open it, you log in, and the agent keeps working 
 
 ## At a glance
 
-| | |
+| Item | Details |
 |---|---|
 | Hermes | 0.23.1 or newer (developed and tested on v0.23.1) |
 | Plugin | 0.1.0, MIT |
