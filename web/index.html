@@ -1,0 +1,257 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Browser viewer</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{color-scheme:dark}
+html,body{margin:0;height:100%;background:#111;color:#ddd;font:13px system-ui;overflow:hidden}
+body{display:flex;flex-direction:column}
+#bar{display:flex;gap:8px;align-items:center;padding:6px 10px;background:#1b1b1b;border-bottom:1px solid #333}
+#st{width:10px;height:10px;border-radius:50%;background:#c33;flex:none}#st.on{background:#3c3}
+#tabs{display:flex;gap:4px;flex:1;min-width:0;overflow-x:auto;scrollbar-width:none}
+.chip{flex:none;max-width:190px;padding:3px 9px;background:#262626;border:1px solid #3a3a3a;border-radius:6px;cursor:pointer;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;color:#bbb}
+.chip.cur{background:#2d3f55;border-color:#4a6a92;color:#fff}.chip.act:before{content:"● ";color:#6c6}
+select,button{background:#2a2a2a;color:#ddd;border:1px solid #444;border-radius:6px;padding:3px 8px;cursor:pointer;font:inherit}
+label{display:flex;gap:4px;align-items:center;white-space:nowrap}
+#info{display:flex;gap:12px;padding:4px 10px;background:#161616;border-bottom:1px solid #2a2a2a}
+#url{flex:1;min-width:0;color:#9cd;font-family:ui-monospace,monospace;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+#stage{display:flex;justify-content:center;align-items:center;padding:8px;flex:1;min-height:0;overflow:hidden;box-sizing:border-box}
+#main{max-width:100%;max-height:100%;width:auto;height:auto;background:#fff;outline:none;box-shadow:0 0 0 1px #333;object-fit:contain;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
+#grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:10px;width:100%;overflow:auto;align-content:start}
+.cell{background:#1b1b1b;border:1px solid #333;border-radius:8px;overflow:hidden;cursor:pointer}
+.cell:hover{border-color:#6a9ad0}.cell canvas{width:100%;display:block;background:#fff;aspect-ratio:4/3;object-fit:contain}
+.cell .cap{padding:4px 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#aaa}
+#kbd.on{background:#2d3f55;border-color:#4a6a92;color:#fff}
+#kb{position:fixed;left:0;bottom:0;width:1px;height:1px;opacity:0;border:0;padding:0;margin:0;resize:none;font-size:16px;pointer-events:none}
+@media (max-width:700px){#bar{flex-wrap:wrap}#tabs{order:9;flex:1 0 100%}}
+[hidden]{display:none!important}
+</style>
+<div id="bar">
+  <span id="st" title="connection"></span>
+  <select id="inst" title="browser"></select>
+  <div id="tabs"></div>
+  <label title="follow the tab the agent is working on"><input type="checkbox" id="follow" checked> follow</label>
+  <button id="kbd" title="keyboard" hidden>⌨</button>
+  <button id="mosaic" title="show all tabs">Mosaic</button>
+  <select id="q" title="stream quality">
+    <option value="auto">Auto</option><option value="high">High</option><option value="med">Medium</option><option value="low">Low</option>
+  </select>
+  <button id="reload">Reload</button>
+</div>
+<div id="info"><span id="url"></span></div>
+<textarea id="kb" rows="1" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" enterkeyhint="go" aria-hidden="true" tabindex="-1"></textarea>
+<div id="stage"><canvas id="main" tabindex="0" width="640" height="400"></canvas><div id="grid" hidden></div></div>
+<script>
+const $ = id => document.getElementById(id);
+const P = new URLSearchParams(location.search);
+const K = P.get('k') || sessionStorage.getItem('bvk') || '';
+if (P.get('k')) { sessionStorage.setItem('bvk', K); P.delete('k'); history.replaceState(null, '', location.pathname + (P.toString() ? '?' + P : '')); }
+let INST = P.get('i') || '', ws = null, retry = 0, manual = false;
+let tabs = [], active = null, pin = null, mode = 'single', qual = 'auto', autoPin = null, autoTimer = 0;
+let idx2tid = {}, cssW = 1280, cssH = 800;
+const main = $('main'), mx = main.getContext('2d'), grid = $('grid'), cells = {};
+
+const curTid = () => (pin && tabs.some(t => t.id === pin)) ? pin : active;
+const send = o => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
+const sendView = () => send({t: 'view', mode, tab: pin, q: qual});
+function touch() {
+  if ($('follow').checked && !pin) { const t = curTid(); if (t) { pin = autoPin = t; sendView(); renderTabs(); } }
+  clearTimeout(autoTimer);
+  if (autoPin) autoTimer = setTimeout(() => {
+    if (autoPin && pin === autoPin && $('follow').checked) { pin = autoPin = null; sendView(); renderTabs(); showUrl(); }
+  }, 10000);
+}
+const label = t => (t.title || '').trim() || (() => { try { return new URL(t.url).host } catch (e) { return t.url || 'new tab' } })();
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws?k=${encodeURIComponent(K)}` + (INST ? `&i=${encodeURIComponent(INST)}` : ''));
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { $('st').classList.add('on'); retry = 0; sendView(); };
+  ws.onclose = () => {
+    $('st').classList.remove('on');
+    if (manual) { manual = false; connect(); return; }
+    if (retry < 20) { retry++; $('url').textContent = 'reconnecting...'; setTimeout(connect, 1500); }
+    else $('url').textContent = 'disconnected: reload the page';
+  };
+  ws.onmessage = e => (e.data instanceof ArrayBuffer) ? onFrame(e.data) : onMsg(JSON.parse(e.data));
+}
+
+function onMsg(m) {
+  if (m.t === 'hello') {
+    INST = m.instance;
+    const s = $('inst'); s.innerHTML = '';
+    m.instances.forEach(n => { const o = document.createElement('option'); o.value = o.textContent = n; s.appendChild(o); });
+    s.value = INST;
+  } else if (m.t === 'tabs') {
+    tabs = m.tabs; active = m.active; idx2tid = {};
+    tabs.forEach(t => idx2tid[t.idx] = t.id);
+    if (pin && !tabs.some(t => t.id === pin)) { pin = autoPin = null; $('follow').checked = true; sendView(); }
+    renderTabs(); renderGrid(); showUrl();
+  } else if (m.t === 'err') {
+    $('url').textContent = m.u;
+    if (m.instances && m.instances.length > 1) INST = '';
+  }
+}
+
+function renderTabs() {
+  const box = $('tabs'); box.innerHTML = '';
+  tabs.forEach(t => {
+    const d = document.createElement('div');
+    d.className = 'chip' + (t.id === curTid() ? ' cur' : '') + (t.id === active ? ' act' : '');
+    d.textContent = label(t); d.title = t.url;
+    d.onclick = () => { pin = t.id; autoPin = null; $('follow').checked = false; mode = 'single'; $('mosaic').textContent = 'Mosaic'; sendView(); renderAll(); };
+    box.appendChild(d);
+  });
+}
+function showUrl() { const t = tabs.find(x => x.id === curTid()); $('url').textContent = t ? t.url : ''; }
+function renderGrid() {
+  if (mode !== 'mosaic') return;
+  const want = tabs.slice().reverse().slice(0, 12);
+  Object.keys(cells).forEach(id => { if (!want.some(t => t.id === id)) { cells[id].el.remove(); delete cells[id]; } });
+  want.forEach(t => {
+    let c = cells[t.id];
+    if (!c) {
+      const el = document.createElement('div'); el.className = 'cell';
+      const cv = document.createElement('canvas'); cv.width = 400; cv.height = 300;
+      const cap = document.createElement('div'); cap.className = 'cap';
+      el.append(cv, cap);
+      el.onclick = () => { pin = t.id; autoPin = null; $('follow').checked = false; mode = 'single'; $('mosaic').textContent = 'Mosaic'; sendView(); renderAll(); };
+      grid.appendChild(el); c = cells[t.id] = {el, cv, cap};
+    }
+    c.cap.textContent = label(t);
+  });
+}
+function renderAll() {
+  main.hidden = mode === 'mosaic'; grid.hidden = mode !== 'mosaic';
+  if (mode === 'mosaic') { Object.values(cells).forEach(c => c.el.remove()); Object.keys(cells).forEach(k => delete cells[k]); }
+  renderTabs(); renderGrid(); showUrl();
+}
+
+async function onFrame(buf) {
+  const dv = new DataView(buf), idx = dv.getUint16(1), w = dv.getUint16(3), h = dv.getUint16(5), fid = dv.getUint16(7);
+  const tid = idx2tid[idx];
+  try {
+    const bmp = await createImageBitmap(new Blob([new Uint8Array(buf, 9)], {type: 'image/jpeg'}));
+    if (mode === 'single') {
+      if (tid === curTid()) {
+        if (main.width !== bmp.width || main.height !== bmp.height) { main.width = bmp.width; main.height = bmp.height; }
+        mx.drawImage(bmp, 0, 0); cssW = w; cssH = h;
+      }
+    } else if (cells[tid]) {
+      const cv = cells[tid].cv;
+      if (cv.width !== bmp.width || cv.height !== bmp.height) { cv.width = bmp.width; cv.height = bmp.height; }
+      cv.getContext('2d').drawImage(bmp, 0, 0);
+    }
+    bmp.close();
+  } catch (e) { /* undecodable frame: still ack so the stream keeps moving */ }
+  send({t: 'ack', f: fid});
+}
+
+// ---- controls
+$('inst').onchange = e => { INST = e.target.value; pin = null; tabs = []; manual = true; ws.close(); };
+$('follow').onchange = e => { autoPin = null; if (e.target.checked) { pin = null; sendView(); renderAll(); } else { pin = curTid(); sendView(); } };
+$('mosaic').onclick = () => { mode = mode === 'single' ? 'mosaic' : 'single'; $('mosaic').textContent = mode === 'mosaic' ? 'Tabs' : 'Mosaic'; sendView(); renderAll(); };
+$('q').onchange = e => { qual = e.target.value; sendView(); };
+$('reload').onclick = () => send({t: 'reload'});
+
+// ---- input (only on the main canvas, only while a single tab is shown)
+// The canvas box can be larger than the picture (object-fit: contain): always map through the rectangle really drawn.
+function fit() { const r = main.getBoundingClientRect(), k = Math.min(r.width / main.width, r.height / main.height), w = main.width * k, h = main.height * k; return {x: r.left + (r.width - w) / 2, y: r.top + (r.height - h) / 2, w, h}; }
+function at(cx, cy, clamp) {
+  const f = fit();
+  let x = (cx - f.x) * cssW / f.w, y = (cy - f.y) * cssH / f.h;
+  if (clamp) return {x: Math.min(Math.max(x, 0), cssW), y: Math.min(Math.max(y, 0), cssH)};
+  return (x < 0 || y < 0 || x > cssW || y > cssH) ? null : {x, y};
+}
+const pos = (e, clamp) => at(e.clientX, e.clientY, clamp);
+const BTN = ['left', 'middle', 'right'], tab = () => curTid();
+const isAltGr = e => !!(e.getModifierState && e.getModifierState('AltGraph'));
+const mods = e => isAltGr(e) ? 0 : (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0);
+const chord = e => (e.metaKey || e.ctrlKey) && !isAltGr(e);
+const mouseMsg = (type, e, p) => ({t: 'mouse', tab: tab(), type, ...p, button: BTN[e.button] || 'left', buttons: e.buttons, mod: mods(e), clickCount: e.detail || 1});
+main.addEventListener('mousedown', e => { main.focus({preventScroll: true}); e.preventDefault(); const p = pos(e); if (!p) return; touch(); send(mouseMsg('mousePressed', e, p)); });
+main.addEventListener('mouseup', e => { e.preventDefault(); send(mouseMsg('mouseReleased', e, pos(e, true))); });
+let lm = 0;
+main.addEventListener('mousemove', e => { const n = performance.now(); if (n - lm < 40) return; lm = n; const p = pos(e); if (p) send({t: 'mouse', tab: tab(), type: 'mouseMoved', ...p, buttons: e.buttons, mod: mods(e)}); });
+main.addEventListener('wheel', e => { e.preventDefault(); const p = pos(e, true); send({t: 'mouse', tab: tab(), type: 'mouseWheel', ...p, deltaX: e.deltaX, deltaY: e.deltaY}); }, {passive: false});
+
+// ---- touch: a tap clicks, a one-finger drag scrolls the remote page
+let tp = null;
+main.addEventListener('touchstart', e => {
+  e.preventDefault();
+  const t = e.touches[0];
+  tp = e.touches.length === 1 ? {x0: t.clientX, y0: t.clientY, x: t.clientX, y: t.clientY, moved: false} : null;
+}, {passive: false});
+main.addEventListener('touchmove', e => {
+  e.preventDefault();
+  if (!tp || e.touches.length !== 1) { tp = null; return; }
+  const t = e.touches[0];
+  if (!tp.moved && Math.hypot(t.clientX - tp.x0, t.clientY - tp.y0) < 10) return;
+  tp.moved = true;
+  const f = fit();
+  send({t: 'mouse', tab: tab(), type: 'mouseWheel', ...at(t.clientX, t.clientY, true), deltaX: -(t.clientX - tp.x) * cssW / f.w, deltaY: -(t.clientY - tp.y) * cssH / f.h});
+  tp.x = t.clientX; tp.y = t.clientY; touch();
+}, {passive: false});
+main.addEventListener('touchend', e => {
+  e.preventDefault();
+  const t = tp; tp = null;
+  if (!t || t.moved) return;
+  const p = at(t.x0, t.y0);
+  if (p) {
+    touch();
+    send({t: 'mouse', tab: tab(), type: 'mousePressed', ...p, button: 'left', buttons: 1, clickCount: 1});
+    send({t: 'mouse', tab: tab(), type: 'mouseReleased', ...p, button: 'left', buttons: 0, clickCount: 1});
+  }
+  if (kbOn) kb.focus({preventScroll: true});     // inside the gesture, so the soft keyboard stays up
+}, {passive: false});
+main.addEventListener('touchcancel', () => { tp = null; });
+main.addEventListener('contextmenu', e => e.preventDefault());
+const SP = {Enter: 13, Backspace: 8, Tab: 9, Escape: 27, ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40, Delete: 46, Home: 36, End: 35, PageUp: 33, PageDown: 34};
+const typing = e => mode === 'single' && !['SELECT', 'INPUT', 'BUTTON', 'TEXTAREA'].includes(e.target.tagName);
+// ---- soft keyboard (touch devices): a hidden textarea receives what the keyboard types and mirrors it to the page.
+// Android keyboards send key 'Unidentified' for letters, so keydown is useless there: the textarea content is diffed instead.
+const kb = $('kb'), SENT = '    ';        // sentinel spaces, so Backspace on an empty box still produces an input event
+let kbOn = false, composing = false, kbPrev = SENT;
+if (matchMedia('(pointer: coarse)').matches) $('kbd').hidden = false;
+function kbReset() { kb.value = kbPrev = SENT; kb.setSelectionRange(SENT.length, SENT.length); }
+function pressKey(key, vk, code, text) {
+  send({t: 'key', tab: tab(), type: 'keyDown', key, code, vk, text: text || ''});
+  send({t: 'key', tab: tab(), type: 'keyUp', key, code, vk});
+}
+function kbSync() {
+  const cur = kb.value, m = Math.min(cur.length, kbPrev.length);
+  let p = 0;
+  while (p < m && cur[p] === kbPrev[p]) p++;
+  const del = kbPrev.length - p, ins = cur.slice(p);
+  kbPrev = cur; touch();
+  for (let i = 0; i < del; i++) pressKey('Backspace', 8, 'Backspace');
+  if (ins) send({t: 'text', tab: tab(), text: ins});
+  if (!composing && (cur.length > 64 || cur.length < SENT.length)) kbReset();
+}
+kb.addEventListener('input', kbSync);
+kb.addEventListener('compositionstart', () => { composing = true; });
+kb.addEventListener('compositionend', () => { composing = false; kbSync(); });
+kb.addEventListener('keydown', e => { if (e.key in SP) { e.preventDefault(); touch(); pressKey(e.key, SP[e.key], e.code, e.key === 'Enter' ? '\r' : ''); } });
+$('kbd').onclick = () => {
+  kbOn = !kbOn; $('kbd').classList.toggle('on', kbOn);
+  if (kbOn) { kbReset(); kb.focus({preventScroll: true}); } else kb.blur();
+};
+document.addEventListener('keydown', e => {
+  if (!typing(e)) return;
+  touch();
+  if (chord(e)) { if (e.key === 'a' || e.key === 'A') { e.preventDefault(); send({t: 'key', tab: tab(), type: 'keyDown', key: 'a', code: 'KeyA', vk: 65, commands: ['selectAll']}); } return; }
+  if (e.key in SP) { e.preventDefault(); send({t: 'key', tab: tab(), type: 'keyDown', key: e.key, code: e.code, vk: SP[e.key], mod: mods(e), text: e.key === 'Enter' ? '\r' : ''}); return; }
+  if (e.key.length === 1) { e.preventDefault(); send({t: 'key', tab: tab(), type: 'keyDown', key: e.key, code: e.code, vk: e.keyCode, mod: mods(e), text: e.key}); }
+});
+document.addEventListener('keyup', e => {
+  if (!typing(e) || chord(e)) return;
+  if (e.key in SP || e.key.length === 1) { e.preventDefault(); send({t: 'key', tab: tab(), type: 'keyUp', key: e.key, code: e.code, vk: SP[e.key] || e.keyCode, mod: mods(e)}); }
+});
+document.addEventListener('paste', e => {
+  if (!typing(e)) return;
+  const t = (e.clipboardData || window.clipboardData).getData('text');
+  if (t) { e.preventDefault(); touch(); send({t: 'text', tab: tab(), text: t}); }
+});
+connect();
+</script>

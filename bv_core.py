@@ -1,0 +1,503 @@
+"""browser-viewer core: instance registry plus Chromium / viewer-server process management.
+
+Standard library only, no relative imports: it is imported by the plugin (``from . import bv_core``)
+and by the server process (``import bv_core``).
+
+State lives in ``$BROWSER_VIEWER_HOME`` or ``<hermes home>/plugin-data/browser-viewer``:
+    instances.json   registry of named browsers (managed = we launched it, external = attached)
+    token            access token of the viewer (0600), stable across restarts until rotated
+    server.json      pid / port / hosts of the running viewer server (written by the server)
+    server.log       viewer server output (never contains the token, keystrokes or pasted text)
+    profiles/<name>  Chromium profile of a managed instance (cookies live here)
+"""
+from __future__ import annotations
+
+import contextlib
+import fcntl
+import glob
+import ipaddress
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+DEFAULT_SERVER_PORT = 9281   # 9280 is left to the legacy login-viewer
+FIRST_CDP_PORT = 9222
+START_TIMEOUT = float(os.environ.get("BV_START_TIMEOUT", "15"))   # seconds to wait for a new Chromium
+LOOPBACK = ("127.0.0.1", "localhost", "[::1]", "::1")
+
+
+class ViewerError(Exception):
+    """A user-facing error: the message is safe to show."""
+
+
+# --------------------------------------------------------------------------- paths / state
+def hermes_home() -> Path:
+    """Home of the ACTIVE profile (never read from os.environ: one process can serve several profiles)."""
+    try:
+        from hermes_constants import get_hermes_home
+        return Path(get_hermes_home())
+    except ImportError:  # detached server process or tests outside Hermes
+        return Path("~/.hermes").expanduser()
+
+
+def home() -> Path:
+    env = os.environ.get("BROWSER_VIEWER_HOME")  # set by the plugin for its own detached server, or by tests
+    if env:
+        p = Path(env).expanduser()
+    else:
+        try:
+            from plugins.plugin_storage import plugin_data_dir
+            p = plugin_data_dir("browser-viewer")
+        except ImportError:
+            p = hermes_home() / "plugin-data" / "browser-viewer"
+    p.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(p, 0o700)
+    return p
+
+
+def _write_private(path: Path, text: str) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+@contextlib.contextmanager
+def _locked():
+    fd = os.open(home() / ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def load_instances() -> Dict[str, Dict[str, Any]]:
+    try:
+        data = json.loads((home() / "instances.json").read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_instances(data: Dict[str, Dict[str, Any]]) -> None:
+    _write_private(home() / "instances.json", json.dumps(data, indent=2, sort_keys=True))
+
+
+def check_name(name: str) -> str:
+    if not isinstance(name, str) or not NAME_RE.fullmatch(name):
+        raise ViewerError("invalid name: use a-z, 0-9, '-' or '_' (max 32 characters, must start with a letter or digit)")
+    return name
+
+
+# --------------------------------------------------------------------------- tiny http helpers
+def _loopback_url(url: str) -> str:
+    """Accept only http://127.0.0.1:PORT-style CDP endpoints: this plugin never reaches other hosts."""
+    m = re.fullmatch(r"http://(127\.0\.0\.1|localhost|\[::1\]):([0-9]{2,5})/?", str(url).strip())
+    if not m:
+        raise ViewerError("the CDP endpoint must be http://127.0.0.1:<port> (loopback only)")
+    return f"http://{m.group(1)}:{m.group(2)}"
+
+
+def http_json(url: str, timeout: float = 2.0) -> Any:
+    with urllib.request.urlopen(url, timeout=timeout) as r:  # noqa: S310 - loopback or own server only
+        return json.loads(r.read().decode())
+
+
+def cdp_alive(cdp: str) -> bool:
+    try:
+        return bool(http_json(cdp + "/json/version", 1.5).get("webSocketDebuggerUrl"))
+    except Exception:
+        return False
+
+
+def cdp_tabs(cdp: str) -> List[Dict[str, Any]]:
+    try:
+        return [t for t in http_json(cdp + "/json/list", 1.5)
+                if t.get("type") == "page" and not str(t.get("url", "")).startswith(("chrome://", "devtools://", "chrome-extension://"))]
+    except Exception:
+        return []
+
+
+def _port_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def _pid_alive(pid: Optional[int]) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, ValueError):
+        return False
+    try:  # an exited child nobody has reaped yet is a zombie: not alive for our purposes
+        with open(f"/proc/{int(pid)}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return True
+
+
+def _proc_start(pid: Optional[int]) -> Optional[int]:
+    """Start time of a process in clock ticks since boot (field 22 of /proc/<pid>/stat): identifies it across pid reuse."""
+    try:
+        with open(f"/proc/{int(pid)}/stat") as f:
+            return int(f.read().rsplit(")", 1)[1].split()[19])
+    except (OSError, ValueError, IndexError, TypeError):
+        return None
+
+
+def _proc_args(pid: Optional[int]) -> List[str]:
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+            return [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
+    except (OSError, ValueError, TypeError):
+        return []
+
+
+def _is_our_browser(inst: Dict[str, Any]) -> bool:
+    """True only if the registered pid is still the Chromium we launched for this profile (not a recycled pid)."""
+    pid, prof = inst.get("pid"), inst.get("profile")
+    # Chromium rewrites its own argv into ONE space-separated string, so match on the joined line
+    if not pid or not prof or not re.search(re.escape(f"--user-data-dir={prof}") + r"(?:\s|$)", " ".join(_proc_args(pid))):
+        return False
+    started = inst.get("starttime")
+    return started is None or _proc_start(pid) == started
+
+
+def _kill_group(pid: int) -> bool:
+    """SIGTERM then SIGKILL the browser's own process group (it is a session leader); True when it is gone."""
+    try:
+        send = os.killpg if os.getpgid(pid) == pid else os.kill
+    except ProcessLookupError:
+        return True
+    for sig, wait in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 2.0)):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            send(pid, sig)
+        t0 = time.time()
+        while time.time() - t0 < wait and _pid_alive(pid):
+            time.sleep(0.1)
+        if not _pid_alive(pid):
+            return True
+    return False
+
+
+# --------------------------------------------------------------------------- chromium
+def _chromium_candidates() -> List[str]:
+    """Installed browsers in order of preference: explicit BV_CHROMIUM, system ones, Hermes' bundled one last."""
+    out: List[str] = []
+    env = os.environ.get("BV_CHROMIUM")
+    if env and os.access(env, os.X_OK):
+        out.append(env)
+    for name in ("chromium", "chromium-browser", "google-chrome-stable", "google-chrome", "chrome"):
+        w = shutil.which(name)
+        if w and w not in out:
+            out.append(w)
+    for cand in sorted(glob.glob(str(hermes_home() / "tools" / "chromium-*" / "chrome-linux64" / "chrome")), reverse=True):
+        if os.access(cand, os.X_OK) and cand not in out:
+            out.append(cand)
+    return out
+
+
+_MAJORS: Dict[str, int] = {}
+
+
+def _major(exe: str) -> int:
+    if exe not in _MAJORS:
+        try:
+            r = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=10)  # noqa: S603
+            m = re.search(r"(\d+)\.\d+\.\d+\.\d+", r.stdout)
+            _MAJORS[exe] = int(m.group(1)) if m else 0
+        except (OSError, subprocess.SubprocessError):
+            _MAJORS[exe] = 0
+    return _MAJORS[exe]
+
+
+def _profile_major(profile: Optional[Path]) -> int:
+    """Major version of the browser that last used this profile (0 = new or unknown)."""
+    if not profile:
+        return 0
+    try:
+        return int((Path(profile) / "Last Version").read_text().strip().split(".")[0])
+    except (OSError, ValueError):
+        return 0
+
+
+def chromium_path(profile: Optional[Path] = None) -> Optional[str]:
+    """Pick a browser. A profile written by a newer Chrome must not be opened by an older one (it crashes)."""
+    cands = _chromium_candidates()
+    need = _profile_major(profile)
+    if not cands or not need:
+        return cands[0] if cands else None
+    for c in cands:
+        if _major(c) >= need:
+            return c
+    raise ViewerError(f"the profile was last used by Chrome {need}: no installed browser is as recent "
+                      "(set BV_CHROMIUM or use another name/profile)")
+
+
+def instance_info(name: str, inst: Dict[str, Any]) -> Dict[str, Any]:
+    alive = cdp_alive(inst["cdp"])
+    return {
+        "name": name, "cdp": inst["cdp"], "managed": bool(inst.get("managed")), "alive": alive,
+        "pid": inst.get("pid"), "profile": inst.get("profile"),
+        "tabs": [{"url": t.get("url", ""), "title": t.get("title", "")} for t in cdp_tabs(inst["cdp"])] if alive else [],
+    }
+
+
+def list_instances() -> List[Dict[str, Any]]:
+    return [instance_info(n, i) for n, i in sorted(load_instances().items())]
+
+
+def start_instance(name: str, url: str = "about:blank", port: Optional[int] = None, headless: bool = True,
+                   size: str = "1280,900", profile: Optional[str] = None) -> Dict[str, Any]:
+    """Launch (or reuse) a managed Chromium with a persistent profile and CDP on loopback."""
+    check_name(name)
+    if not re.fullmatch(r"[0-9]{3,4},[0-9]{3,4}", size):
+        raise ViewerError("size must be WIDTH,HEIGHT (e.g. 1280,900)")
+    if not re.match(r"(https?://|about:blank\Z)", url):
+        raise ViewerError("url must start with http:// or https://")
+    with _locked():
+        reg = load_instances()
+        cur = reg.get(name)
+        if cur and cdp_alive(cur["cdp"]):
+            return {**instance_info(name, cur), "reused": True}
+        prof = Path(profile).expanduser() if profile else home() / "profiles" / name
+        exe = chromium_path(prof)
+        if not exe:
+            raise ViewerError("no Chromium found (set BV_CHROMIUM or install chromium)")
+        used = {int(i["port"]) for n, i in reg.items() if n != name}
+        if port is None:
+            port = next((p for p in range(FIRST_CDP_PORT, FIRST_CDP_PORT + 200) if p not in used and _port_free(p)), None)
+            if port is None:
+                raise ViewerError("no free debug port")
+        elif port in used or not _port_free(port):
+            raise ViewerError(f"port {port} is in use")
+        prof.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            os.chmod(prof, 0o700)
+        args = [exe, f"--remote-debugging-port={port}", f"--user-data-dir={prof}", "--no-first-run",
+                "--no-default-browser-check", f"--window-size={size}",
+                "--disable-background-timer-throttling", "--disable-renderer-backgrounding",
+                "--disable-backgrounding-occluded-windows"]
+        if headless:
+            args.append("--headless=new")
+        args.append(url)
+        with open(home() / f"chromium-{name}.log", "ab") as log:
+            proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)  # noqa: S603
+        cdp = f"http://127.0.0.1:{port}"
+        err = None
+        deadline = time.monotonic() + START_TIMEOUT
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:     # checked first: an answer on the port must come from OUR process
+                err = f"Chromium exited immediately (code {proc.returncode}); see chromium-{name}.log"
+                break
+            if cdp_alive(cdp):
+                break
+            time.sleep(0.15)
+        else:
+            err = "Chromium is not responding on the debug port"
+        if err:
+            if proc.poll() is None:
+                _kill_group(proc.pid)
+            proc.poll()                      # reap
+            raise ViewerError(err)
+        reg[name] = {"cdp": cdp, "port": port, "managed": True, "pid": proc.pid, "starttime": _proc_start(proc.pid),
+                     "profile": str(prof), "created": int(time.time())}
+        _save_instances(reg)
+        return {**instance_info(name, reg[name]), "reused": False}
+
+
+def adopt_instance(name: str, cdp: str) -> Dict[str, Any]:
+    """Register an already-running browser (loopback CDP only). Hermes never stops it."""
+    check_name(name)
+    cdp = _loopback_url(cdp)
+    if not cdp_alive(cdp):
+        raise ViewerError(f"no browser is responding on {cdp}")
+    with _locked():
+        reg = load_instances()
+        cur = reg.get(name)
+        if cur and cur.get("managed") and cdp_alive(cur["cdp"]):
+            raise ViewerError(f"'{name}' is a running browser managed by the plugin: choose another name")
+        reg[name] = {"cdp": cdp, "port": int(cdp.rsplit(":", 1)[1]), "managed": False, "pid": None,
+                     "profile": None, "created": int(time.time())}
+        _save_instances(reg)
+        return instance_info(name, reg[name])
+
+
+def stop_instance(name: str, purge: bool = False) -> Dict[str, Any]:
+    check_name(name)
+    with _locked():
+        reg = load_instances()
+        inst = reg.get(name)
+        if not inst:
+            raise ViewerError(f"istanza '{name}' sconosciuta")
+        killed, stale = False, False
+        pid = inst.get("pid")
+        if inst.get("managed") and _pid_alive(pid):
+            if _is_our_browser(inst):
+                killed = _kill_group(int(pid))
+                if not killed:      # still running: keep the registry entry and the profile
+                    raise ViewerError(f"cannot stop browser '{name}' (pid {pid}); retry or stop it by hand")
+            else:
+                stale = True        # the pid now belongs to something else: never signal it
+        del reg[name]
+        _save_instances(reg)
+        purged = False
+        prof = inst.get("profile")
+        if purge and prof and Path(prof).resolve().parent == (home() / "profiles").resolve():
+            shutil.rmtree(prof, ignore_errors=True)
+            purged = True
+        out = {"name": name, "stopped": killed, "managed": bool(inst.get("managed")), "profile_deleted": purged}
+        if stale:
+            out["note"] = "the registered pid is no longer our browser (already closed): no process was touched"
+        return out
+
+
+# --------------------------------------------------------------------------- token / hosts / server
+def get_token(rotate: bool = False) -> str:
+    p = home() / "token"
+    if rotate or not p.exists():
+        _write_private(p, secrets.token_urlsafe(24))
+    return p.read_text().strip()
+
+
+def tailscale_ip() -> Optional[str]:
+    exe = shutil.which("tailscale")
+    if not exe:
+        return None
+    try:
+        out = subprocess.run([exe, "ip", "-4"], capture_output=True, text=True, timeout=3).stdout.split()  # noqa: S603
+    except Exception:
+        return None
+    return out[0] if out and re.match(r"^\d+\.\d+\.\d+\.\d+$", out[0]) else None
+
+
+def default_hosts() -> List[str]:
+    env = os.environ.get("BROWSER_VIEWER_HOSTS")
+    if env:
+        return [h.strip() for h in env.split(",") if h.strip()]
+    ts = tailscale_ip()
+    return ["127.0.0.1"] + ([ts] if ts else [])
+
+
+def server_info() -> Optional[Dict[str, Any]]:
+    try:
+        info = json.loads((home() / "server.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not _pid_alive(info.get("pid")):
+        return None
+    try:
+        http_json(f"http://127.0.0.1:{info['port']}/healthz", 1.5)
+    except Exception:
+        return None
+    return info
+
+
+def _python_cmd() -> List[str]:
+    try:
+        import aiohttp  # noqa: F401
+    except ImportError:
+        raise ViewerError("aiohttp is missing: install the plugin with its dependencies (hermes plugins install)") from None
+    return [sys.executable]
+
+
+def start_server(port: int = DEFAULT_SERVER_PORT, hosts: Optional[List[str]] = None, idle_minutes: int = 60) -> Dict[str, Any]:
+    info = server_info()
+    if info:
+        return {**info, "reused": True}
+    hosts = hosts or default_hosts()
+    for h in hosts:
+        try:
+            ip = ipaddress.ip_address(h)
+        except ValueError:
+            ip = None
+        if ip is None or ip.version != 4 or ip.is_unspecified or str(ip) != h:
+            raise ViewerError(f"invalid host: {h} (specific IPv4 addresses only, never 0.0.0.0)")
+    get_token()
+    cmd = _python_cmd() + [str(Path(__file__).with_name("bv_server.py")), "--port", str(int(port)), "--idle", str(int(idle_minutes))]
+    for h in hosts:
+        cmd += ["--host", h]
+    env = dict(os.environ, BROWSER_VIEWER_HOME=str(home()))
+    with open(home() / "server.log", "ab") as log:  # the child keeps its own copy of the descriptor
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True, env=env)  # noqa: S603
+    for _ in range(300):  # up to 60 s
+        info = server_info()
+        if info:
+            return {**info, "reused": False}
+        time.sleep(0.2)
+    raise ViewerError("the server did not start: see server.log in the plugin data directory")
+
+
+def stop_server() -> Dict[str, Any]:
+    try:
+        info = json.loads((home() / "server.json").read_text())
+        pid = int(info["pid"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return {"stopped": False, "note": "server not running"}
+    if not _pid_alive(pid) or not re.search(r"bv_server\.py(?:\s|$)", " ".join(_proc_args(pid))):
+        with contextlib.suppress(OSError):
+            (home() / "server.json").unlink()
+        return {"stopped": False, "note": "server not running"}
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.kill(pid, signal.SIGTERM)
+    t0 = time.time()
+    while time.time() - t0 < 6 and _pid_alive(pid):
+        time.sleep(0.1)
+    if _pid_alive(pid):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, signal.SIGKILL)
+    return {"stopped": True}
+
+
+# --------------------------------------------------------------------------- which browser browser_exec drives
+def cdp_in_use() -> Optional[str]:
+    """The CDP endpoint this plugin last wrote into browser.cdp_url (None if it did not, or cleared it)."""
+    try:
+        return json.loads((home() / "state.json").read_text()).get("cdp_url")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def set_cdp_in_use(cdp: Optional[str]) -> None:
+    _write_private(home() / "state.json", json.dumps({"cdp_url": cdp}))
+
+
+def links(instance: Optional[str] = None) -> List[str]:
+    info = server_info()
+    if not info:
+        return []
+    tok = get_token()
+    q = f"?k={tok}" + (f"&i={instance}" if instance else "")
+    return [f"http://{h}:{info['port']}/{q}" for h in info.get("hosts", [])]
+
+
+def status() -> Dict[str, Any]:
+    info = server_info()
+    return {
+        "server": ({"running": True, "port": info["port"], "hosts": info.get("hosts", []), "pid": info["pid"],
+                    "idle_minutes": info.get("idle_minutes")} if info else {"running": False}),
+        "instances": list_instances(),
+        "chromium": chromium_path(),
+        "data_dir": str(home()),
+    }

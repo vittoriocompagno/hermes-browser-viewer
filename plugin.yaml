@@ -1,0 +1,11 @@
+name: browser-viewer
+version: 0.1.0
+requires_hermes: ">=0.23.1"
+description: "Live view and human takeover of the browser Hermes drives. Streams tabs to a web page you open from another device (mouse, keyboard, paste), several windows and several browsers at once, adaptive quality. For logins, 2FA, CAPTCHA, or just watching the agent work."
+author: "Vittorio Compagno"
+license: MIT
+tags: [browser, handoff, login, cdp, streaming]
+provides_tools:
+  - browser_viewer
+python_dependencies:
+  - "aiohttp>=3.9,<4"
