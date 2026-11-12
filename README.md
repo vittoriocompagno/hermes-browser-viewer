@@ -12,6 +12,7 @@
 Agents get stuck on logins, 2FA codes and CAPTCHAs. This plugin streams the tabs of the Chromium that Hermes controls to a web page you open from another device. You see what the agent sees, you click, type, scroll and paste yourself, and when you are done the agent carries on in the same logged-in browser.
 
 <p align="center">
+  <a href="#instructions-for-agents">For agents</a> ·
   <a href="#install">Install</a> ·
   <a href="#use">Use</a> ·
   <a href="#https">HTTPS</a> ·
@@ -19,6 +20,32 @@ Agents get stuck on logins, 2FA codes and CAPTCHAs. This plugin streams the tabs
   <a href="#disclosure">Disclosure</a> ·
   <a href="#known-limitations">Limitations</a>
 </p>
+
+## Instructions for agents
+
+Running a Hermes agent? Copy the box and paste it into your chat. The agent installs the plugin and knows how to hand you the browser when it needs a login.
+
+```text
+Set up and use the browser-viewer plugin for Hermes (https://github.com/vittoriocompagno/hermes-browser-viewer).
+
+What it is for: when you hit a login, a 2FA code or a CAPTCHA in the browser, you give me a link. I open it on my phone or laptop, see your browser live and type the credentials myself. Then you carry on in the same logged-in browser.
+
+Setup, once:
+1. Check the requirements: Linux, Hermes 0.23.1 or newer (hermes --version) and a Chromium or Chrome binary (which chromium).
+2. Run: hermes plugins install vittoriocompagno/hermes-browser-viewer
+3. Run: hermes plugins enable browser-viewer
+4. The browser_viewer tool appears in a new session. Tell me to open one if you cannot see it.
+
+Whenever you need me to log in:
+1. Call browser_viewer with action "start" (browser name "login" unless I say otherwise). It returns the login link.
+2. Send me the link. It works once and expires after 10 minutes; call action "link" for a fresh one, for example for another device. If the only link is on 127.0.0.1, it opens on this machine only: tell me.
+3. Wait while I log in on that page. Never type my password, my 2FA code or any other credential yourself, and never write the link into files, notes or memory.
+4. When I say I am done, take a screenshot and check that the page shows the logged-in state.
+5. If I want you to keep working in that browser with browser_exec, call action "use" with name "login", then open a NEW browser_exec session. "use" sets browser.cdp_url for every Hermes session, cron jobs included, so do it only because I asked or agreed. When we are finished, call "use" with name "clear".
+
+Other actions: "status" and "list" show what is running, "new" starts another browser with its own profile (one per account), "stop" stops a browser (add what="server" to stop the streaming server), "rotate_token" signs every browser out and gives a fresh link.
+Do not change settings such as HTTPS (hermes browser-viewer tls) unless I ask. If something fails, run hermes browser-viewer status and tell me what it says.
+```
 
 <table>
   <tr>
