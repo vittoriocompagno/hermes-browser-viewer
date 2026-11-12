@@ -1,26 +1,77 @@
+<p align="center">
+  <img alt="Hermes 0.23.1 or newer" src="https://img.shields.io/badge/Hermes-%E2%89%A5%200.23.1-1a73e8?style=flat-square">
+  <img alt="plugin version 0.1.0" src="https://img.shields.io/badge/plugin-0.1.0-0a84ff?style=flat-square">
+  <img alt="Linux" src="https://img.shields.io/badge/platform-Linux-34c759?style=flat-square">
+  <img alt="MIT license" src="https://img.shields.io/badge/license-MIT-8e8e93?style=flat-square">
+</p>
+
 # browser-viewer
 
-Live view and human takeover of the browser Hermes drives.
+**See the browser your Hermes agent is driving, live, from your phone or laptop, and take the keyboard when it needs you.**
 
-The plugin streams the tabs of a Chromium that Hermes controls to a web page you open from another device (phone, laptop). You see what the agent sees and you can click, type, scroll and paste yourself. Use it to log in, pass 2FA or a CAPTCHA, or just watch the agent work. When you are done, the agent keeps using the same logged-in browser.
+Agents get stuck on logins, 2FA codes and CAPTCHAs. This plugin streams the tabs of the Chromium that Hermes controls to a web page you open from another device. You see what the agent sees, you click, type, scroll and paste yourself, and when you are done the agent carries on in the same logged-in browser.
 
-- Several windows and several browsers at once, each browser with its own persistent profile (one per account).
-- Follow mode: the page follows the tab the agent works on, and pins to the tab you are using while you type.
-- Adaptive stream quality from the measured round-trip time of each client, or a fixed level.
-- Mouse, keyboard (including AltGr), drag, paste, and touch (tap clicks, one-finger drag scrolls, a keyboard button opens the phone keyboard).
-- Login links are single-use and short-lived; the browser then holds an `HttpOnly` session cookie. No keystrokes, pasted text or secrets are written to any log.
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#use">Use</a> ·
+  <a href="#https">HTTPS</a> ·
+  <a href="#security-model">Security</a> ·
+  <a href="#disclosure">Disclosure</a> ·
+  <a href="#known-limitations">Limitations</a>
+</p>
 
-Linux only: process identity checks read `/proc`.
+<table>
+  <tr>
+    <td width="68%"><img src="https://raw.githubusercontent.com/vittoriocompagno/hermes-browser-viewer/main/docs/screenshot-desktop.png" alt="The viewer on a laptop, streaming a sign-in page"></td>
+    <td width="32%"><img src="https://raw.githubusercontent.com/vittoriocompagno/hermes-browser-viewer/main/docs/screenshot-phone.png" alt="The viewer on a phone, streaming the same page"></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>On a laptop</sub></td>
+    <td align="center"><sub>On a phone</sub></td>
+  </tr>
+</table>
+
+## How it works
+
+```
+ Hermes agent ──── CDP ───▶  Chromium (managed, persistent profile)
+                                  │  JPEG screencast
+                                  ▼
+ you ── one-time login link ─▶  viewer server ──── WebSocket ───▶  your phone or laptop
+                                                                   see, click, type, paste
+```
+
+The agent asks for a link, you open it, you log in, and the agent keeps working with the cookies you just created. The streaming server runs as its own detached process, so it outlives the chat session, and it shuts itself down after 60 minutes with no open window.
+
+## What you get
+
+- Several windows and several browsers at once, each browser with its own persistent profile, for example one per account.
+- A follow mode: the page follows the tab the agent works on and pins to the tab you are using while you type.
+- Stream quality that adapts to each client's round-trip time, or a level you fix yourself.
+- Mouse, keyboard (AltGr included), drag and paste, plus touch: a tap clicks, one finger scrolls, and a keyboard button opens the phone keyboard.
+- Single-use login links and an `HttpOnly` session cookie. No keystroke, pasted text or secret is written to any log.
+
+## At a glance
+
+| | |
+|---|---|
+| Hermes | 0.23.1 or newer (developed and tested on v0.23.1) |
+| Plugin | 0.1.0, MIT |
+| System | Linux, tested on Arch-based Omarchy, x86_64 (process checks read `/proc`) |
+| Browser | Chromium or Chrome, tested with Chromium 155 |
+| Viewing device | any current browser, touch supported |
+| Network | loopback, or a Tailscale address; plain HTTP by default, HTTPS opt-in |
 
 ## Install
 
 ```bash
-hermes plugins install browser-viewer          # from the catalog, once listed
-hermes plugins install vittoriocompagno/hermes-browser-viewer   # straight from GitHub
+hermes plugins install vittoriocompagno/hermes-browser-viewer     # straight from GitHub
+hermes plugins install browser-viewer                             # from the Hermes catalog, once it is listed
 hermes plugins enable browser-viewer
+hermes browser-viewer start                                       # prints a login link: open it on your phone
 ```
 
-Requires Hermes `>=0.23.1`, Python dependency `aiohttp>=3.9,<4` (installed with the plugin) and a Chromium or Chrome binary on the machine (`chromium`, `google-chrome-stable`, a path in `BV_CHROMIUM`, or one Hermes installed under its `tools/` directory).
+Requirements: Hermes `>=0.23.1`, the Python dependency `aiohttp>=3.9,<4` (installed with the plugin) and a Chromium or Chrome binary on the machine (`chromium`, `google-chrome-stable`, a path in `BV_CHROMIUM`, or one Hermes installed under its `tools/` directory).
 
 ## Use
 
