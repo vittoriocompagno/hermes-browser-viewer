@@ -38,9 +38,9 @@ SCHEMA = {
         "browser.cdp_url, which affects EVERY Hermes session (other chats, cron jobs) until cleared; only when the "
         "user asks; then open a NEW browser_exec session name); use with name 'clear' = back to the default clean "
         "browser; stop = stop a browser (also clears browser.cdp_url if it pointed there) or the server; "
-        "rotate_token = new link.\n"
+        "rotate_token = sign every browser out and return a fresh link.\n"
         "After 'start', give the user the link and tell them to log in; then call use, and continue with browser_exec. "
-        "The link contains a secret token: share it only with the user."
+        "The link works once, for 10 minutes, and signs in the browser that opens it: share it only with the user."
     ),
     "parameters": {
         "type": "object",
@@ -84,7 +84,8 @@ def _links_payload(name: str | None) -> Dict[str, Any]:
         if hosts == ["127.0.0.1"]:
             out["warning"] = ("the server listens on loopback only (no Tailscale IP found): "
                               "the link works only on this machine")
-        out["note"] = ("the link contains a secret token and stays valid until you rotate it; "
+        out["note"] = (f"each link works once, for {bv_core.BOOTSTRAP_TTL // 60} minutes; opening it signs that browser in "
+                       "(session cookie), ask for another link for another device, rotate_token signs everyone out; "
                        f"the server shuts down after {info.get('idle_minutes') or '∞'} minutes with no open window")
     return out
 
@@ -93,7 +94,7 @@ def run_action(args: Dict[str, Any]) -> Dict[str, Any]:
     action = str(args.get("action", "")).strip()
     name = (args.get("name") or "").strip() or None
     if action not in ACTIONS:
-        raise bv_core.ViewerError(f"azione sconosciuta: {action!r} (valide: {', '.join(ACTIONS)})")
+        raise bv_core.ViewerError(f"unknown action: {action!r} (valid: {', '.join(ACTIONS)})")
 
     if action == "status":
         return bv_core.status()
@@ -234,7 +235,7 @@ def _setup_cli(parser) -> None:
     p.add_argument("name", nargs="?")
     p.add_argument("--server", action="store_true")
     p.add_argument("--purge", action="store_true", help="also delete the profile (cookies and logins)")
-    p = sub.add_parser("token", help="show the link; with --rotate generate a new one")
+    p = sub.add_parser("token", help="show a fresh login link; with --rotate sign every browser out first")
     p.add_argument("--rotate", action="store_true")
     parser.set_defaults(func=_cli)
 

@@ -44,8 +44,16 @@ label{display:flex;gap:4px;align-items:center;white-space:nowrap}
 <script>
 const $ = id => document.getElementById(id);
 const P = new URLSearchParams(location.search);
-const K = P.get('k') || sessionStorage.getItem('bvk') || '';
-if (P.get('k')) { sessionStorage.setItem('bvk', K); P.delete('k'); history.replaceState(null, '', location.pathname + (P.toString() ? '?' + P : '')); }
+// A link carries a one-time ?b= token. It is exchanged for an HttpOnly session cookie and removed from the address bar,
+// so no secret is left in the page, in sessionStorage or in the history entry that matters.
+const authed = async () => { try { return (await fetch('/api/auth', {cache: 'no-store'})).ok; } catch (e) { return true; } };
+async function signIn() {
+  const b = P.get('b');
+  if (!b) return;
+  P.delete('b'); history.replaceState(null, '', location.pathname + (P.toString() ? '?' + P : ''));
+  try { await fetch('/api/session', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({b})}); } catch (e) { /* authed() decides */ }
+}
+const signedOut = () => { $('url').textContent = 'not signed in: this link has expired or was already used. Ask for a new one (hermes browser-viewer link).'; };
 let INST = P.get('i') || '', ws = null, retry = 0, manual = false;
 let tabs = [], active = null, pin = null, mode = 'single', qual = 'auto', autoPin = null, autoTimer = 0;
 let idx2tid = {}, cssW = 1280, cssH = 800;
@@ -65,13 +73,13 @@ const label = t => (t.title || '').trim() || (() => { try { return new URL(t.url
 
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws?k=${encodeURIComponent(K)}` + (INST ? `&i=${encodeURIComponent(INST)}` : ''));
+  ws = new WebSocket(`${proto}://${location.host}/ws` + (INST ? `?i=${encodeURIComponent(INST)}` : ''));
   ws.binaryType = 'arraybuffer';
   ws.onopen = () => { $('st').classList.add('on'); retry = 0; sendView(); };
   ws.onclose = () => {
     $('st').classList.remove('on');
     if (manual) { manual = false; connect(); return; }
-    if (retry < 20) { retry++; $('url').textContent = 'reconnecting...'; setTimeout(connect, 1500); }
+    if (retry < 20) { retry++; $('url').textContent = 'reconnecting...'; setTimeout(async () => { if (await authed()) connect(); else signedOut(); }, 1500); }
     else $('url').textContent = 'disconnected: reload the page';
   };
   ws.onmessage = e => (e.data instanceof ArrayBuffer) ? onFrame(e.data) : onMsg(JSON.parse(e.data));
@@ -253,5 +261,5 @@ document.addEventListener('paste', e => {
   const t = (e.clipboardData || window.clipboardData).getData('text');
   if (t) { e.preventDefault(); touch(); send({t: 'text', tab: tab(), text: t}); }
 });
-connect();
+signIn().then(async () => { if (await authed()) connect(); else signedOut(); });
 </script>

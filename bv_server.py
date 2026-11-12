@@ -9,7 +9,7 @@ Design
   throttled (screencast ack is held) while every watcher is busy, so latency does not build up.
 - Quality adapts to the client's measured round-trip time; the user can also pin a level.
 - Mosaic mode shows every tab with low-cost snapshots (hidden tabs emit no screencast frames).
-- Security: token on every request, Origin must match Host, loopback-only CDP endpoints,
+- Security: a signed session cookie (or the master token) on every request, Origin must match Host, loopback-only CDP endpoints,
   bind only to explicit addresses, never logs keystrokes, pasted text or the token.
 """
 from __future__ import annotations
@@ -18,6 +18,8 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import hashlib
+import hmac
 import ipaddress
 import json
 import os
@@ -598,9 +600,37 @@ class Hub:
 
 
 # --------------------------------------------------------------------------- http layer
-def _token_ok(request: web.Request) -> bool:
+SESSION_SECONDS = int(float(os.environ.get("BV_SESSION_HOURS", "168")) * 3600)   # how long a signed-in browser stays in
+
+
+def _sign(exp: int, nonce: str, master: str) -> str:
+    return hmac.new(master.encode(), f"{exp}.{nonce}".encode(), hashlib.sha256).hexdigest()
+
+
+def make_session(master: str) -> str:
+    exp, nonce = int(time.time()) + SESSION_SECONDS, secrets.token_urlsafe(9)
+    return f"{exp}.{nonce}.{_sign(exp, nonce, master)}"
+
+
+def session_ok(value: str, master: str) -> bool:
+    try:
+        exp_s, nonce, sig = value.split(".", 2)
+        exp = int(exp_s)
+    except ValueError:
+        return False
+    return exp > time.time() and secrets.compare_digest(sig.encode(), _sign(exp, nonce, master).encode())
+
+
+def _authed(request: web.Request) -> bool:
+    """A signed session cookie (what the page uses), or the master token in ?k= / X-BV-Token (scripts, tests)."""
+    master = request.app["token_fn"]()
+    if not master:
+        return False
+    cookie = request.cookies.get(request.app["cookie_name"], "")
+    if cookie and session_ok(cookie, master):
+        return True
     tok = request.query.get("k") or request.headers.get("X-BV-Token", "")
-    return bool(tok) and secrets.compare_digest(tok.encode(), request.app["token_fn"]().encode())
+    return bool(tok) and secrets.compare_digest(tok.encode(), master.encode())
 
 
 def _origin_ok(request: web.Request) -> bool:
@@ -612,9 +642,9 @@ def _origin_ok(request: web.Request) -> bool:
 
 
 async def index(request: web.Request) -> web.Response:
-    # The page is static and holds no secret: the token (from the link, kept in sessionStorage) is only needed by
-    # /ws and /api/stats. Serving the shell without it lets a reload work after the page removed ?k= from its URL
-    # (a phone browser restoring a discarded tab reloads exactly that stripped URL).
+    # The page is static and holds no secret. A link carries a one-time ?b= token that the page exchanges for a
+    # session cookie (POST /api/session); serving the shell without any token lets a reload work afterwards, and
+    # a prefetcher that merely GETs the link cannot use the token up.
     return web.Response(body=request.app["index_html"], content_type="text/html", charset="utf-8",
                         headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
 
@@ -623,8 +653,33 @@ async def healthz(_request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+async def session_login(request: web.Request) -> web.Response:
+    """Exchange a one-time login token for an HttpOnly session cookie. Same-origin browser requests only."""
+    if not request.headers.get("Origin") or not _origin_ok(request):
+        raise web.HTTPForbidden(text="origin")
+    try:
+        data = await request.json()
+    except Exception:  # noqa: BLE001 - any malformed body is a plain 400
+        raise web.HTTPBadRequest() from None
+    tok = data.get("b") if isinstance(data, dict) else None
+    if not bv_core.consume_bootstrap(tok):
+        raise web.HTTPForbidden(text="this link has expired or was already used")
+    master = request.app["token_fn"]()
+    resp = web.json_response({"ok": True})
+    resp.set_cookie(request.app["cookie_name"], make_session(master), max_age=SESSION_SECONDS,
+                    httponly=True, samesite="Strict", path="/")
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+async def auth_check(request: web.Request) -> web.Response:
+    if not _authed(request):
+        raise web.HTTPForbidden()
+    return web.json_response({"ok": True}, headers={"Cache-Control": "no-store"})
+
+
 async def stats(request: web.Request) -> web.Response:
-    if not _token_ok(request):
+    if not _authed(request):
         raise web.HTTPForbidden()
     return web.json_response([h.stats() for h in request.app["hubs"].values() if not h.closed])
 
@@ -636,7 +691,7 @@ async def get_hub(app: web.Application, name: str) -> Hub:
             return hub
         inst = bv_core.load_instances().get(name)
         if not inst:
-            raise bv_core.ViewerError(f"istanza '{name}' sconosciuta")
+            raise bv_core.ViewerError(f"unknown browser '{name}'")
         hub = Hub(name, bv_core._loopback_url(inst["cdp"]))
         try:
             await hub.start()
@@ -648,7 +703,7 @@ async def get_hub(app: web.Application, name: str) -> Hub:
 
 
 async def ws_handler(request: web.Request) -> web.StreamResponse:
-    if not _token_ok(request):
+    if not _authed(request):
         raise web.HTTPForbidden()
     if not _origin_ok(request):
         raise web.HTTPForbidden(text="origin")
@@ -662,7 +717,7 @@ async def ws_handler(request: web.Request) -> web.StreamResponse:
             raise bv_core.ViewerError("no browser registered: start one with 'hermes browser-viewer start'")
         hub = await get_hub(app, name)
         if len(hub.clients) >= MAX_CLIENTS_PER_HUB:
-            raise bv_core.ViewerError("troppe finestre aperte su questo browser")
+            raise bv_core.ViewerError("too many windows open on this browser")
     except bv_core.ViewerError as exc:
         await ws.send_str(json.dumps({"t": "err", "u": str(exc), "instances": names}))
         await ws.close()
@@ -721,7 +776,7 @@ async def idle_watchdog(app: web.Application, idle_minutes: int) -> None:
         if busy:
             app["seen"] = time.time()
         elif idle_minutes and time.time() - app["seen"] > idle_minutes * 60:
-            print("viewer: inattivo, esco", flush=True)
+            print("viewer: idle, exiting", flush=True)
             os.kill(os.getpid(), signal.SIGTERM)
             return
 
@@ -755,9 +810,11 @@ async def main() -> None:
     bv_core.get_token()
     app = web.Application()
     app["token_fn"] = token
+    app["cookie_name"] = f"bvs_{a.port}"      # cookies are not isolated by port, so the name carries it
     app["hubs"], app["hub_locks"], app["seen"] = {}, {}, time.time()
     app["index_html"] = (Path(__file__).resolve().parent / "web" / "index.html").read_bytes()
-    app.add_routes([web.get("/", index), web.get("/ws", ws_handler), web.get("/healthz", healthz), web.get("/api/stats", stats)])
+    app.add_routes([web.get("/", index), web.get("/ws", ws_handler), web.get("/healthz", healthz), web.get("/api/stats", stats),
+                    web.get("/api/auth", auth_check), web.post("/api/session", session_login)])
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     for h in a.host:

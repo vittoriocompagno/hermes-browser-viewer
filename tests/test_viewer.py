@@ -213,6 +213,77 @@ class ViewerTests(unittest.IsolatedAsyncioTestCase):
                 await s.ws_connect(f"{BASE}/ws?k={old}&i=t1")
             self.assertEqual(cm.exception.status, 403)
 
+    # ---------------------------------------------------------------- one-time login link -> session cookie
+    @staticmethod
+    def _b(link):
+        return urllib.parse.parse_qs(urllib.parse.urlparse(link).query)["b"][0]
+
+    @staticmethod
+    def _jar_session():
+        return aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True))      # the host is an IP address
+
+    async def test_login_link_is_single_use_and_signs_the_browser_in(self):
+        (link,) = bv_core.links("t1")
+        self.assertIn("?b=", link)
+        self.assertNotIn(bv_core.get_token(), link, "the master token must never be in a link")
+        b = self._b(link)
+        async with self._jar_session() as s:
+            self.assertEqual((await s.get(f"{BASE}/api/auth")).status, 403)
+            self.assertEqual((await s.get(f"{BASE}/?b={b}")).status, 200)            # merely opening the link uses nothing up
+            r = await s.post(f"{BASE}/api/session", json={"b": b}, headers={"Origin": BASE})
+            self.assertEqual(r.status, 200)
+            cookie = r.headers.getone("Set-Cookie")
+            self.assertIn("HttpOnly", cookie)
+            self.assertIn("SameSite=Strict", cookie)
+            self.assertTrue(cookie.startswith(f"bvs_{PORT}="))
+            self.assertEqual((await s.get(f"{BASE}/api/auth")).status, 200)
+            self.assertEqual((await s.get(f"{BASE}/api/stats")).status, 200)        # cookie only, no ?k=
+            ws = await s.ws_connect(f"{BASE}/ws?i=t1")
+            self.assertEqual((await ws.receive(timeout=5)).type, aiohttp.WSMsgType.TEXT)
+            await ws.close()
+        async with self._jar_session() as other:                                     # the same link a second time
+            r = await other.post(f"{BASE}/api/session", json={"b": b}, headers={"Origin": BASE})
+            self.assertEqual(r.status, 403)
+            self.assertEqual((await other.get(f"{BASE}/api/stats")).status, 403)
+
+    async def test_login_refuses_foreign_origin_bad_bodies_and_expired_tokens(self):
+        async with self._jar_session() as s:
+            b = bv_core.new_bootstrap()
+            for headers in ({}, {"Origin": "http://evil.example"}, {"Origin": "http://127.0.0.1:1"}):
+                r = await s.post(f"{BASE}/api/session", json={"b": b}, headers=headers)
+                self.assertEqual(r.status, 403, headers)
+            self.assertEqual((await s.post(f"{BASE}/api/session", data="not json", headers={"Origin": BASE})).status, 400)
+            for body in ({"b": 5}, {"b": ""}, {"x": 1}, [1], "str", {"b": "x" * 500}):
+                r = await s.post(f"{BASE}/api/session", json=body, headers={"Origin": BASE})
+                self.assertEqual(r.status, 403, body)
+            r = await s.post(f"{BASE}/api/session", json={"b": b}, headers={"Origin": BASE})
+            self.assertEqual(r.status, 200, "a refused request must not use the token up")
+            expired = bv_core.new_bootstrap(ttl=-1)
+            r = await s.post(f"{BASE}/api/session", json={"b": expired}, headers={"Origin": BASE})
+            self.assertEqual(r.status, 403)
+
+    async def test_forged_and_expired_cookies_and_rotation_sign_everyone_out(self):
+        import bv_server
+        master = bv_core.get_token()
+        exp = int(time.time()) - 5
+        cookies = {
+            "garbage": "x",
+            "wrong-signature": f"{int(time.time()) + 3600}.n.{'0' * 64}",
+            "expired": f"{exp}.n.{bv_server._sign(exp, 'n', master)}",
+            "non-ascii": "é.é.é",
+        }
+        async with aiohttp.ClientSession() as s:
+            for label, value in cookies.items():
+                r = await s.get(f"{BASE}/api/stats", headers={"Cookie": f"bvs_{PORT}={value}"})
+                self.assertEqual(r.status, 403, label)
+            good = bv_server.make_session(master)
+            self.assertEqual((await s.get(f"{BASE}/api/stats", headers={"Cookie": f"bvs_{PORT}={good}"})).status, 200)
+            unused = bv_core.new_bootstrap()
+            bv_core.get_token(rotate=True)
+            self.assertEqual((await s.get(f"{BASE}/api/stats", headers={"Cookie": f"bvs_{PORT}={good}"})).status, 403)
+            r = await s.post(f"{BASE}/api/session", json={"b": unused}, headers={"Origin": BASE})
+            self.assertEqual(r.status, 403, "rotating must also drop the links that were not used yet")
+
     # ---------------------------------------------------------------- streaming + input
     async def test_stream_frames_and_input(self):
         async with Cdp(self.inst["cdp"]) as b:
@@ -586,6 +657,36 @@ class CoreTests(unittest.TestCase):
             self.assertTrue(bv_core.cdp_alive(a["cdp"]), "stopping an adopted browser must leave it running")
         finally:
             bv_core.stop_instance("ext-src", purge=True)
+
+    def test_bootstrap_tokens_are_single_use_expire_and_store_only_a_hash(self):
+        tok = bv_core.new_bootstrap()
+        d = bv_core.home() / "bootstrap"
+        self.assertEqual(oct(d.stat().st_mode & 0o777), "0o700")
+        names = [f.name for f in d.iterdir()]
+        self.assertTrue(names and all(tok not in n for n in names), "the token itself must not be on disk")
+        self.assertTrue(all(oct(f.stat().st_mode & 0o777) == "0o600" for f in d.iterdir()))
+        self.assertTrue(bv_core.consume_bootstrap(tok))
+        self.assertFalse(bv_core.consume_bootstrap(tok))
+        self.assertFalse(bv_core.consume_bootstrap(bv_core.new_bootstrap(ttl=-1)))
+        for bad in ("", None, 5, "x" * 300, "../../etc/passwd"):
+            self.assertFalse(bv_core.consume_bootstrap(bad))
+        a, b = bv_core.new_bootstrap(), bv_core.new_bootstrap()
+        bv_core.purge_bootstrap()
+        self.assertFalse(bv_core.consume_bootstrap(a) or bv_core.consume_bootstrap(b))
+
+    def test_links_carry_a_fresh_one_time_token_each(self):
+        real = bv_core.server_info
+        bv_core.server_info = lambda: {"port": 1234, "hosts": ["127.0.0.1", "10.1.2.3"]}
+        try:
+            links = bv_core.links("x")
+        finally:
+            bv_core.server_info = real
+        self.assertEqual(len(links), 2)
+        tokens = [urllib.parse.parse_qs(urllib.parse.urlparse(u).query)["b"][0] for u in links]
+        self.assertNotEqual(tokens[0], tokens[1])
+        self.assertTrue(all("&i=x" in u and bv_core.get_token() not in u for u in links))
+        for tk in tokens:
+            self.assertTrue(bv_core.consume_bootstrap(tk))
 
     def test_token_is_private_and_stable(self):
         t1 = bv_core.get_token()

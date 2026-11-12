@@ -5,7 +5,8 @@ and by the server process (``import bv_core``).
 
 State lives in ``$BROWSER_VIEWER_HOME`` or ``<hermes home>/plugin-data/browser-viewer``:
     instances.json   registry of named browsers (managed = we launched it, external = attached)
-    token            access token of the viewer (0600), stable across restarts until rotated
+    token            master secret of the viewer (0600); signs session cookies, never put in a link
+    bootstrap/       one-time login tokens (SHA-256 file names, 0700)
     server.json      pid / port / hosts of the running viewer server (written by the server)
     server.log       viewer server output (never contains the token, keystrokes or pasted text)
     profiles/<name>  Chromium profile of a managed instance (cookies live here)
@@ -15,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import glob
+import hashlib
 import ipaddress
 import json
 import os
@@ -350,7 +352,7 @@ def stop_instance(name: str, purge: bool = False) -> Dict[str, Any]:
         reg = load_instances()
         inst = reg.get(name)
         if not inst:
-            raise ViewerError(f"istanza '{name}' sconosciuta")
+            raise ViewerError(f"unknown browser '{name}'")
         killed, stale = False, False
         pid = inst.get("pid")
         if inst.get("managed") and _pid_alive(pid):
@@ -375,10 +377,58 @@ def stop_instance(name: str, purge: bool = False) -> Dict[str, Any]:
 
 # --------------------------------------------------------------------------- token / hosts / server
 def get_token(rotate: bool = False) -> str:
+    """The master secret of the viewer. It never appears in a link: it signs the session cookies, so rotating it
+    signs every browser out (and drops the login links that were handed out but not used yet)."""
     p = home() / "token"
     if rotate or not p.exists():
         _write_private(p, secrets.token_urlsafe(24))
+        if rotate:
+            purge_bootstrap()
     return p.read_text().strip()
+
+
+BOOTSTRAP_TTL = 600   # seconds a login link stays valid
+
+
+def _bootstrap_dir() -> Path:
+    d = home() / "bootstrap"
+    d.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(d, 0o700)
+    return d
+
+
+def new_bootstrap(ttl: int = BOOTSTRAP_TTL) -> str:
+    """A one-time login token. Only its SHA-256 is stored, as a file name; the file holds the expiry time."""
+    d = _bootstrap_dir()
+    now = time.time()
+    for f in d.iterdir():                       # drop expired leftovers
+        with contextlib.suppress(OSError, ValueError):
+            if float(f.read_text()) < now:
+                f.unlink()
+    tok = secrets.token_urlsafe(24)
+    _write_private(d / hashlib.sha256(tok.encode()).hexdigest(), str(now + ttl))
+    return tok
+
+
+def consume_bootstrap(tok: str) -> bool:
+    """True exactly once for a valid, unexpired token. Unlinking the file is the atomic step: of two
+    simultaneous requests only one can remove it."""
+    if not isinstance(tok, str) or not tok or len(tok) > 200:
+        return False
+    p = _bootstrap_dir() / hashlib.sha256(tok.encode()).hexdigest()
+    try:
+        expires = float(p.read_text())
+        p.unlink()
+    except (OSError, ValueError):
+        return False
+    return expires >= time.time()
+
+
+def purge_bootstrap() -> None:
+    for f in _bootstrap_dir().iterdir():
+        with contextlib.suppress(OSError):
+            f.unlink()
 
 
 def tailscale_ip() -> Optional[str]:
@@ -487,9 +537,9 @@ def links(instance: Optional[str] = None) -> List[str]:
     info = server_info()
     if not info:
         return []
-    tok = get_token()
-    q = f"?k={tok}" + (f"&i={instance}" if instance else "")
-    return [f"http://{h}:{info['port']}/{q}" for h in info.get("hosts", [])]
+    # one single-use login token per link: opening it signs that browser in with a session cookie
+    return [f"http://{h}:{info['port']}/?b={new_bootstrap()}" + (f"&i={instance}" if instance else "")
+            for h in info.get("hosts", [])]
 
 
 def status() -> Dict[str, Any]:

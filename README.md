@@ -8,7 +8,7 @@ The plugin streams the tabs of a Chromium that Hermes controls to a web page you
 - Follow mode: the page follows the tab the agent works on, and pins to the tab you are using while you type.
 - Adaptive stream quality from the measured round-trip time of each client, or a fixed level.
 - Mouse, keyboard (including AltGr), drag, paste, and touch (tap clicks, one-finger drag scrolls, a keyboard button opens the phone keyboard).
-- No keystrokes, pasted text or token are written to any log.
+- Login links are single-use and short-lived; the browser then holds an `HttpOnly` session cookie. No keystrokes, pasted text or secrets are written to any log.
 
 Linux only: process identity checks read `/proc`.
 
@@ -35,12 +35,12 @@ hermes browser-viewer use login        # make browser_exec drive this browser
 hermes browser-viewer use --clear      # back to the default clean browser
 hermes browser-viewer stop login       # stop a browser (add --purge to also delete its profile)
 hermes browser-viewer stop --server    # stop the streaming server
-hermes browser-viewer token --rotate   # new link, the old one stops working immediately
+hermes browser-viewer token --rotate   # sign every browser out, then print a fresh login link
 ```
 
 From a chat: the `browser_viewer` tool (actions `status`, `start`, `link`, `list`, `new`, `adopt`, `use`, `stop`, `rotate_token`) and the `/viewer` slash command. The agent starts a viewer, gives you the link, and after you have logged in switches `browser_exec` to that browser with `use`.
 
-Open the link from the device you want to control the browser from. The server listens on the addresses you choose with `BROWSER_VIEWER_HOSTS`, by default loopback plus the machine's Tailscale IPv4 if `tailscale` is installed. It never binds `0.0.0.0`. It shuts itself down after 60 minutes with no open window.
+Open the link from the device you want to control the browser from. It works once and for 10 minutes: use `link` again for another device. The server listens on the addresses you choose with `BROWSER_VIEWER_HOSTS`, by default loopback plus the machine's Tailscale IPv4 if `tailscale` is installed. It never binds `0.0.0.0`. It shuts itself down after 60 minutes with no open window.
 
 ## Configuration
 
@@ -50,15 +50,17 @@ Open the link from the device you want to control the browser from. The server l
 | `BV_CHROMIUM` | path to the Chromium or Chrome binary | auto-detected |
 | `BV_START_TIMEOUT` | seconds to wait for a new Chromium | `15` |
 | `BV_CLOSE_GRACE` | seconds an empty hub keeps its CDP connection | `20` |
+| `BV_SESSION_HOURS` | how long a signed-in browser stays signed in | `168` (7 days) |
 | `BROWSER_VIEWER_HOME` | override of the data directory (the plugin sets it for its own server process; useful for tests) | the plugin data dir of the active profile |
 
-State lives in the plugin data directory (`<hermes home>/plugin-data/browser-viewer/`): browser registry, profiles, token, logs.
+State lives in the plugin data directory (`<hermes home>/plugin-data/browser-viewer/`): browser registry, profiles, master secret, pending login tokens, logs.
 
 ## Security model
 
 - Whoever holds the link controls a browser that may be logged in to your accounts. Treat the link like a password.
-- The token is random, stored in a `0600` file inside a `0700` directory, required for the WebSocket and the stats endpoint, and rotated without restarting the server. The static page is served without it.
-- The page moves the token from the address bar into `sessionStorage` right after loading.
+- A link carries a one-time login token (192 random bits, valid 10 minutes). The page sends it with a same-origin `POST /api/session` and receives an `HttpOnly; SameSite=Strict` session cookie (named after the server port, 7 days by default). Merely opening or prefetching the URL does not use the token up, only that POST does; the token is then removed from the address bar. Only its SHA-256 is stored on the server, in a `0700` directory, and consuming it is an atomic file removal, so two simultaneous requests cannot both succeed.
+- The cookie is an HMAC-SHA256 signature over its expiry, keyed with a master secret kept in a `0600` file. The master secret never appears in a link, a page or a tool result. Rotating it (`rotate_token`, `token --rotate`) signs every browser out at once and drops login links that were not used yet, without restarting the server. Scripts can still present the master secret as `X-BV-Token`.
+- The WebSocket and the stats endpoint need the cookie (or the master secret). The static page is served without either and contains no secret.
 - The CDP port of every browser listens on `127.0.0.1` only. Adopted browsers must be loopback endpoints, and the plugin never kills a browser it did not start.
 - Cross-origin WebSocket connections are refused (`Origin` must match `Host`).
 - Input is accepted only for the tab a client is viewing, and is dropped for 0.8 s after a tab change the user did not ask for.
@@ -76,12 +78,13 @@ What you should know before installing:
 - **Background processes.** The streaming server is a detached process that outlives Hermes sessions and exits by itself after the idle timeout. Managed Chromium processes keep running until stopped.
 - **Reads outside its own data.** `/proc/<pid>` for process identity, and the Chromium builds Hermes installed under `<hermes home>/tools/`.
 - **Local CDP access.** Any CDP client on the same machine, Hermes included, can read what is in a page, password fields included. This plugin does not add that exposure, but it is why you should keep the host single-user.
-- **Token in the tool result.** The link, token included, is returned by the `start` and `link` actions, so it appears in the session transcript. Rotate it with `rotate_token` if a transcript is shared.
+- **Links in the tool result.** `start` and `link` return login links. They work once and expire after 10 minutes, so a transcript does not hold anything reusable once a link has been used or has expired.
+- **Plain HTTP.** The server speaks HTTP, so the session cookie has no `Secure` flag and neither it nor the stream is encrypted on the wire. On a Tailscale network WireGuard encrypts everything; on any other network use a tunnel or do not expose the port.
 - **Telemetry.** None.
 
 ## Known limitations
 
-- The token is long-lived and travels in the link. A one-time bootstrap token exchanged for an `HttpOnly` cookie would be stronger and is not implemented.
+- No TLS and no per-device session list: a session lasts until it expires or the master secret is rotated, and rotating signs every browser out.
 - Frame rate and bandwidth were measured on loopback with simulated delay, not on real WAN links.
 - On a phone in portrait the remote page (1280 px wide) is scaled to about a third, so fields are small. Landscape is much more comfortable.
 - The tool handler is synchronous: a cold start can block for up to about 75 seconds (15 s for Chromium plus up to 60 s for the server).
