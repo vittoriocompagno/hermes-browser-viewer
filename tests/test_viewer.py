@@ -7,17 +7,23 @@ Everything runs on scratch ports with a throw-away data dir: a browser or viewer
 is never touched.
 """
 import asyncio
+import atexit
+import http.server
+import importlib.util
 import json
 import os
 import shutil
+import socket
 import ssl
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.parse
+import urllib.request
 from pathlib import Path
 
 import aiohttp
@@ -26,6 +32,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 TMP = tempfile.mkdtemp(prefix="bv-test-")
 os.environ["BROWSER_VIEWER_HOME"] = TMP
 os.environ["BV_CLOSE_GRACE"] = "1"
+os.environ["BV_AUTH_RECHECK"] = "0.5"      # open streams re-check their credential twice a second (5 s in real life)
+atexit.register(shutil.rmtree, TMP, True)
 import bv_core  # noqa: E402
 
 PORT = 9391
@@ -115,7 +123,7 @@ class Viewer:
 
     async def __aenter__(self):
         self.s = aiohttp.ClientSession()
-        self.ws = await self.s.ws_connect(f"{BASE}/ws?k={self.token}&i={self.instance}", max_msg_size=2 ** 24)
+        self.ws = await self.s.ws_connect(f"{BASE}/ws?i={self.instance}", headers=tok_header(self.token), max_msg_size=2 ** 24)
         self.task = asyncio.create_task(self._read())
         return self
 
@@ -162,9 +170,26 @@ async def until(cond, timeout=6.0, step=0.05):
     return False
 
 
+def tok_header(token=None):
+    return {"X-BV-Token": token or bv_core.get_token()}
+
+
+def procs_with(arg):
+    """pids whose command line contains `arg` (a /proc scan: pgrep -f would also match its own shell)."""
+    out = []
+    for d in Path("/proc").iterdir():
+        if d.name.isdigit() and int(d.name) != os.getpid():
+            try:
+                if arg.encode() in (d / "cmdline").read_bytes():
+                    out.append(int(d.name))
+            except OSError:
+                pass
+    return out
+
+
 async def stats():
     async with aiohttp.ClientSession() as s:
-        return await (await s.get(f"{BASE}/api/stats?k={bv_core.get_token()}")).json()
+        return await (await s.get(f"{BASE}/api/stats", headers=tok_header())).json()
 
 
 def _stop_instance(name):
@@ -187,32 +212,166 @@ class ViewerTests(unittest.IsolatedAsyncioTestCase):
         cls.srv = bv_core.start_server(port=PORT, hosts=["127.0.0.1"], idle_minutes=0)
     # ---------------------------------------------------------------- auth
     async def test_auth(self):
+        tok = bv_core.get_token()
         async with aiohttp.ClientSession() as s:
-            tok = bv_core.get_token()
-            r = await s.get(f"{BASE}/?k={tok}")
-            self.assertEqual(r.status, 200)
+            r = await s.get(f"{BASE}/")
+            self.assertEqual(r.status, 200)                              # the static shell needs no credential
             self.assertIn("no-store", r.headers.get("Cache-Control", ""))
             self.assertNotIn(tok, await r.text(), "the page itself must never contain the token")
-            self.assertEqual((await s.get(f"{BASE}/")).status, 200)      # static shell: a reload works without ?k=
-            self.assertEqual((await s.get(f"{BASE}/api/stats?k=wrong")).status, 403)
+            self.assertEqual((await s.get(f"{BASE}/api/stats", headers=tok_header("wrong"))).status, 403)
             self.assertEqual((await s.get(f"{BASE}/api/stats")).status, 403)
+            self.assertEqual((await s.get(f"{BASE}/api/stats?k={tok}")).status, 403, "a master token in a URL is not accepted")
+            self.assertEqual((await s.get(f"{BASE}/api/stats", headers=tok_header())).status, 200)
             self.assertEqual((await s.get(f"{BASE}/healthz")).status, 200)
             with self.assertRaises(aiohttp.WSServerHandshakeError) as cm:
-                await s.ws_connect(f"{BASE}/ws?k=wrong&i=t1")
+                await s.ws_connect(f"{BASE}/ws?i=t1", headers=tok_header("wrong"))
             self.assertEqual(cm.exception.status, 403)
             with self.assertRaises(aiohttp.WSServerHandshakeError) as cm:   # cross-site page with a valid token
-                await s.ws_connect(f"{BASE}/ws?k={bv_core.get_token()}&i=t1", headers={"Origin": "http://evil.example"})
+                await s.ws_connect(f"{BASE}/ws?i=t1", headers={**tok_header(), "Origin": "http://evil.example"})
             self.assertEqual(cm.exception.status, 403)
 
     async def test_token_rotation_without_restart(self):
         old = bv_core.get_token()
         new = bv_core.get_token(rotate=True)
         async with aiohttp.ClientSession() as s:
-            self.assertEqual((await s.get(f"{BASE}/api/stats?k={old}")).status, 403)
-            self.assertEqual((await s.get(f"{BASE}/api/stats?k={new}")).status, 200)
+            self.assertEqual((await s.get(f"{BASE}/api/stats", headers=tok_header(old))).status, 403)
+            self.assertEqual((await s.get(f"{BASE}/api/stats", headers=tok_header(new))).status, 200)
             with self.assertRaises(aiohttp.WSServerHandshakeError) as cm:
-                await s.ws_connect(f"{BASE}/ws?k={old}&i=t1")
+                await s.ws_connect(f"{BASE}/ws?i=t1", headers=tok_header(old))
             self.assertEqual(cm.exception.status, 403)
+
+    async def _until_closed(self, ws, timeout=8):
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            m = await ws.receive(timeout=timeout)
+            if m.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING):
+                return True
+        return False
+
+    async def test_open_stream_is_closed_when_the_master_secret_is_rotated(self):
+        async with aiohttp.ClientSession() as s:
+            ws = await s.ws_connect(f"{BASE}/ws?i=t1", headers=tok_header())
+            self.assertEqual((await ws.receive(timeout=5)).type, aiohttp.WSMsgType.TEXT)
+            bv_core.get_token(rotate=True)
+            self.assertTrue(await self._until_closed(ws), "a signed-out browser kept streaming")
+            self.assertEqual(ws.close_code, 4401)
+
+    async def test_open_stream_is_closed_when_the_session_cookie_expires(self):
+        import bv_server
+        exp = int(time.time()) + 2
+        cookie = f"{exp}.n.{bv_server._sign(exp, 'n', bv_core.get_token())}"
+        async with aiohttp.ClientSession() as s:
+            ws = await s.ws_connect(f"{BASE}/ws?i=t1", headers={"Cookie": f"bvs_{PORT}={cookie}"})
+            self.assertEqual((await ws.receive(timeout=5)).type, aiohttp.WSMsgType.TEXT)
+            self.assertTrue(await self._until_closed(ws), "an expired session kept streaming")
+            self.assertEqual(ws.close_code, 4401)
+
+    async def test_origin_must_match_scheme_and_host_and_the_host_must_be_one_we_serve(self):
+        async with aiohttp.ClientSession() as s:
+            r = await s.get(f"{BASE}/healthz", headers={"Host": "evil.example"})
+            self.assertEqual(r.status, 421, "a host name this server does not serve is refused (DNS rebinding)")
+            self.assertEqual((await s.get(f"{BASE}/healthz", headers={"Host": f"localhost:{PORT}"})).status, 200)
+            for origin in (f"https://127.0.0.1:{PORT}", f"http://127.0.0.1:{PORT + 1}", "null", "http://127.0.0.1"):
+                r = await s.post(f"{BASE}/api/session", json={"b": bv_core.new_bootstrap()}, headers={"Origin": origin})
+                self.assertEqual(r.status, 403, origin)
+                with self.assertRaises(aiohttp.WSServerHandshakeError) as cm:
+                    await s.ws_connect(f"{BASE}/ws?i=t1", headers={**tok_header(), "Origin": origin})
+                self.assertEqual(cm.exception.status, 403, origin)
+            ok = await s.post(f"{BASE}/api/session", json={"b": bv_core.new_bootstrap()}, headers={"Origin": BASE})
+            self.assertEqual(ok.status, 200)
+
+    async def test_security_headers_on_pages_and_errors(self):
+        async with aiohttp.ClientSession() as s:
+            for path in ("/", "/api/stats", "/healthz"):
+                r = await s.get(f"{BASE}{path}")
+                h = r.headers
+                self.assertEqual(h.get("X-Content-Type-Options"), "nosniff", path)
+                self.assertEqual(h.get("X-Frame-Options"), "DENY", path)
+                self.assertIn("frame-ancestors 'none'", h.get("Content-Security-Policy", ""), path)
+                self.assertEqual(h.get("Referrer-Policy"), "no-referrer", path)
+                self.assertNotIn("Strict-Transport-Security", h, "HSTS would pin the whole host name")
+
+    async def test_non_utf8_credentials_are_403_never_500(self):
+        for head in (b"X-BV-Token: \xff\xfe\xfd", f"Cookie: bvs_{PORT}=\xff.\xff.\xff".encode("latin-1")):
+            reader, writer = await asyncio.open_connection("127.0.0.1", PORT)
+            writer.write(b"GET /api/stats HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n" % PORT + head + b"\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+            line = (await reader.readline()).decode("latin-1")
+            writer.close()
+            self.assertIn(" 403 ", line, head)
+        async with aiohttp.ClientSession() as s:
+            r = await s.post(f"{BASE}/api/session", data='{"b": "\\ud800"}', headers={"Origin": BASE, "Content-Type": "application/json"})
+            self.assertEqual(r.status, 403)
+
+    async def test_login_link_works_in_a_real_browser_under_the_csp(self):
+        (link,) = bv_core.links("t1")
+        async with Cdp(self.inst2["cdp"]) as b:                 # the second managed browser plays the user's device
+            tid = await b.new_tab(link)
+            try:
+                dot = lambda: b.evaluate(tid, "document.getElementById('st').classList.contains('on')")
+                drawn = lambda: b.evaluate(tid, "(() => { const d = document.getElementById('main').getContext('2d').getImageData(0, 0, 64, 64).data; return d.some(v => v !== 0); })()")
+                for _ in range(80):
+                    if await dot() and await drawn():
+                        break
+                    await asyncio.sleep(0.15)
+                self.assertTrue(await dot(), "the stream never connected: is the CSP blocking the page?")
+                self.assertTrue(await drawn(), "the canvas stayed empty")
+                href = await b.evaluate(tid, "location.href")
+                self.assertNotIn("b=", href, "the one-time token must leave the address bar")
+            finally:
+                await b.close_tab(tid)
+
+    async def test_every_screencast_ack_that_is_owed_is_sent_on_release(self):
+        import bv_server
+        hub = bv_server.Hub("x", "http://127.0.0.1:1")
+        sent = []
+
+        async def fire(method, sid=None, **params):
+            sent.append((method, sid, params))
+        hub.fire = fire
+
+        class Busy:                                   # a watcher with no room: the browser has to wait
+            WINDOW = 2
+            inflight = [1, 2]
+            pending = []
+
+            def has_capacity(self):
+                return False
+
+            def offer(self, *a):
+                pass
+        hub.subscribers = lambda tid: [Busy()]
+        st = bv_server.Stream(hub, "T")
+        st.sid = "S"
+        hub.streams["T"] = st
+        frame = lambda sid: {"metadata": {"deviceWidth": 4, "deviceHeight": 4}, "data": "eA==", "sessionId": sid}
+        try:
+            hub._on_cast_frame(st, frame(1))
+            timer = st.hold_timer
+            hub._on_cast_frame(st, frame(2))
+            hub._on_cast_frame(st, frame(3))
+            self.assertIs(st.hold_timer, timer, "a later frame must not replace the running hold timer")
+            self.assertEqual(st.holds, [1, 2, 3])
+            self.assertEqual(sent, [], "no ack while every watcher is busy")
+            hub._release_hold(st)
+            await asyncio.sleep(0.05)
+            self.assertEqual([p["sessionId"] for m, sid, p in sent if m == "Page.screencastFrameAck"], [1, 2, 3],
+                             "frames whose ack was never sent shrink Chromium's window for good")
+        finally:
+            await hub.http.close()
+
+    async def test_a_window_that_joins_a_static_page_gets_a_picture_at_once(self):
+        static = data_url("<title>static</title><body style='margin:0;background:#fde68a'><h1>nothing moves here</h1>")
+        async with Cdp(self.inst["cdp"]) as b:
+            tid = await b.new_tab(static)
+            try:
+                async with Viewer("t1") as first:
+                    self.assertTrue(await until(lambda: first.active == tid and first.count(first.idx_of(tid)) >= 1, 8))
+                    async with Viewer("t1") as second:       # a reload, a second device: the page itself never repaints
+                        self.assertTrue(await until(lambda: second.active == tid and second.count(second.idx_of(tid)) >= 1, 3),
+                                        "the new window stayed blank until the page changed")
+            finally:
+                await b.close_tab(tid)
 
     # ---------------------------------------------------------------- one-time login link -> session cookie
     @staticmethod
@@ -481,9 +640,7 @@ class ViewerTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await b.close_tab(a)
 
-    async def test_malformed_messages_are_ignored_and_non_ascii_token_is_403(self):
-        async with aiohttp.ClientSession() as s:
-            self.assertEqual((await s.get(f"{BASE}/api/stats?k=%C3%A9")).status, 403)    # non-ASCII token: 403, never a 500
+    async def test_malformed_messages_are_ignored(self):
         async with Cdp(self.inst["cdp"]) as b:
             tid = await b.new_tab(ANIM)
             try:
@@ -604,8 +761,7 @@ class CoreTests(unittest.TestCase):
             with self.assertRaises(bv_core.ViewerError):
                 bv_core.start_instance("orphan")
             time.sleep(0.5)
-            out = subprocess.run(["pgrep", "-f", "--", f"--user-data-dir={prof}"], capture_output=True, text=True)
-            self.assertEqual(out.stdout.strip(), "", "a browser that never answered must not be left running")
+            self.assertEqual(procs_with(f"--user-data-dir={prof}"), [], "a browser that never answered must not be left running")
             self.assertNotIn("orphan", bv_core.load_instances())
         finally:
             if old_env is None:
@@ -790,10 +946,16 @@ class TlsSettingsTests(unittest.TestCase):
 
     def test_files_mode_validates_and_off_removes(self):
         self.assertIsNone(bv_core.tls_settings())
-        for kwargs in ({}, {"name": "bad name!"}, {"name": "ok.example"}):
-            with self.assertRaises(bv_core.ViewerError):
-                bv_core.set_tls("files", cert=str(self.cert), key=str(self.d / "missing.pem") if kwargs.get("name") == "ok.example" else None, **kwargs)
-        res = bv_core.set_tls("files", cert=str(self.cert), key=str(self.key), name="Box.Test.ts.net")
+        good = dict(cert=str(self.cert), key=str(self.key))
+        for label, kwargs in (("no name", dict(good)),
+                              ("bad name", dict(good, name="bad name!")),
+                              ("name with a slash", dict(good, name="a/b.example")),
+                              ("missing key file", dict(cert=str(self.cert), key=str(self.d / "missing.pem"), name="ok.example")),
+                              ("no certificate", dict(key=str(self.key), name="ok.example"))):
+            with self.assertRaises(bv_core.ViewerError, msg=label):
+                bv_core.set_tls("files", **kwargs)
+            self.assertIsNone(bv_core.tls_settings(), label)
+        res = bv_core.set_tls("files", name="Box.Test.ts.net", **good)
         self.assertEqual(res["name"], "box.test.ts.net")
         self.assertEqual(bv_core.tls_settings()["name"], "box.test.ts.net")
         self.assertEqual(oct((bv_core.home() / "tls.json").stat().st_mode & 0o777), "0o600")
@@ -801,6 +963,7 @@ class TlsSettingsTests(unittest.TestCase):
             bv_core.set_tls("nonsense")
         bv_core.set_tls("off")
         self.assertIsNone(bv_core.tls_settings())
+        self.assertTrue(self.key.exists(), "a key you supplied is yours: off must never delete it")
 
     def _fake_tailscale(self, cert_domains):
         bin_dir = self.d / "bin"
@@ -813,7 +976,7 @@ if a[:2] == ["status", "--json"]:
     print(json.dumps({{"Self": {{"DNSName": "box.test.ts.net."}}, "CertDomains": {cert_domains!r}}}))
 elif a[0] == "cert":
     cert, key = a[a.index("--cert-file") + 1], a[a.index("--key-file") + 1]
-    open(sys.argv[-1] + ".called", "w").write(" ".join(a))
+    open({str(self.d / "tailscale-calls.log")!r}, "a").write(" ".join(a) + "\\n")
     shutil.copy({str(self.cert)!r}, cert); shutil.copy({str(self.key)!r}, key)
 """)
         script.chmod(0o755)
@@ -830,6 +993,77 @@ elif a[0] == "cert":
         self.assertTrue(Path(rec["cert"]).is_file() and Path(rec["key"]).is_file())
         self.assertEqual(oct(Path(rec["key"]).stat().st_mode & 0o777), "0o600")
         self.assertEqual(oct((bv_core.home() / "tls").stat().st_mode & 0o777), "0o700")
+        calls = (self.d / "tailscale-calls.log").read_text().splitlines()
+        self.assertEqual(len(calls), 1)
+        args = calls[0].split()
+        self.assertEqual(args[0], "cert")
+        self.assertEqual(args[args.index("--cert-file") + 1], rec["cert"])
+        self.assertEqual(args[args.index("--key-file") + 1], rec["key"])
+        self.assertEqual(args[-1], "box.test.ts.net", "tailscale cert must be asked for this machine's own name")
+        bv_core.set_tls("off")
+        self.assertFalse(Path(rec["key"]).exists(), "off removes the key copy that tailscale mode made")
+
+    @staticmethod
+    def _local_ipv4():
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("10.255.255.255", 1))
+            ip = s.getsockname()[0]
+        except OSError:
+            return None
+        finally:
+            s.close()
+        return None if ip.startswith("127.") else ip
+
+    def test_start_server_serves_https_on_the_non_loopback_address_and_links_use_the_name(self):
+        ip = self._local_ipv4()
+        if not ip:
+            self.skipTest("no non-loopback IPv4 address on this machine")
+        bv_core.set_tls("files", cert=str(self.cert), key=str(self.key), name="box.test.ts.net")
+        info = bv_core.start_server(port=9396, hosts=["127.0.0.1", ip], idle_minutes=0)
+        self.addCleanup(bv_core.stop_server)
+        self.assertEqual(info["tls"]["hosts"], [ip])
+        self.assertEqual(info["tls"]["name"], "box.test.ts.net")
+        self.assertIsNotNone(bv_core.server_info(), "the liveness probe must work with a TLS address")
+        self.assertEqual([u.split("/?b=")[0] for u in bv_core.links()], ["http://127.0.0.1:9396", "https://box.test.ts.net:9396"])
+        ctx = ssl._create_unverified_context()
+        with urllib.request.urlopen(f"https://{ip}:9396/healthz", timeout=5, context=ctx) as r:
+            self.assertEqual(r.status, 200)
+        with self.assertRaises(Exception):
+            urllib.request.urlopen(f"http://{ip}:9396/healthz", timeout=5)       # plain HTTP is not served there
+        with urllib.request.urlopen("http://127.0.0.1:9396/healthz", timeout=5) as r:     # loopback stays plain
+            self.assertEqual(r.status, 200)
+
+    def test_tailscale_trouble_never_blocks_start_and_never_downgrades(self):
+        ip = self._local_ipv4()
+        if not ip:
+            self.skipTest("no non-loopback IPv4 address on this machine")
+        self._fake_tailscale(["box.test.ts.net"])
+        bv_core.set_tls("tailscale")
+        calls = self.d / "tailscale-calls.log"
+        calls.write_text("")
+        broken = self.d / "bin" / "tailscale"
+        broken.write_text("#!/bin/sh\necho nope >&2\nexit 1\n")
+        # loopback only: TLS is not in play, tailscale must not even be asked
+        info = bv_core.start_server(port=9395, hosts=["127.0.0.1"], idle_minutes=0)
+        self.assertNotIn("tls", info)
+        bv_core.stop_server()
+        # a TLS address while tailscale is down: the certificate on disk is reused, with a warning, still over HTTPS
+        info = bv_core.start_server(port=9395, hosts=["127.0.0.1", ip], idle_minutes=0)
+        self.addCleanup(bv_core.stop_server)
+        self.assertEqual(info["tls"]["hosts"], [ip])
+        self.assertTrue(info.get("warnings") and "could not refresh" in info["warnings"][0], info)
+
+    def test_a_server_that_dies_at_start_is_reported_at_once_with_the_reason(self):
+        busy = socket.socket()
+        busy.bind(("127.0.0.1", 0))
+        busy.listen(1)
+        self.addCleanup(busy.close)
+        t0 = time.time()
+        with self.assertRaises(bv_core.ViewerError) as cm:
+            bv_core.start_server(port=busy.getsockname()[1], hosts=["127.0.0.1"], idle_minutes=0)
+        self.assertLess(time.time() - t0, 25, "must not wait out the 60 s timeout")
+        self.assertIn("exited", str(cm.exception))
 
     def test_tailscale_mode_refuses_when_the_tailnet_offers_no_certificate(self):
         self._fake_tailscale([])
@@ -837,6 +1071,116 @@ elif a[0] == "cert":
             bv_core.set_tls("tailscale")
         self.assertIn("HTTPS", str(cm.exception))
         self.assertIsNone(bv_core.tls_settings())
+
+
+# --------------------------------------------------------------------------- the tool layer and the registry
+class _FakeCdp(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = json.dumps({"webSocketDebuggerUrl": "ws://127.0.0.1:1/devtools/browser/x", "Browser": "Fake/1"}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+
+class PluginActionTests(unittest.TestCase):
+    """__init__.py (the tool) against a fake `hermes` on PATH and a fake CDP endpoint."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp(prefix="bv-act-"))
+        self.addCleanup(shutil.rmtree, self.d, True)
+        self.old_home = os.environ["BROWSER_VIEWER_HOME"]
+        os.environ["BROWSER_VIEWER_HOME"] = str(self.d / "home")
+        self.addCleanup(os.environ.__setitem__, "BROWSER_VIEWER_HOME", self.old_home)
+        self.log = self.d / "hermes.log"
+        self.fail_flag = self.d / "fail-unset"
+        bindir = self.d / "bin"
+        bindir.mkdir()
+        fake = bindir / "hermes"
+        fake.write_text(f"#!/bin/sh\necho \"$@\" >> {self.log}\n"
+                        f"if [ \"$2\" = unset ] && [ -e {self.fail_flag} ]; then echo boom >&2; exit 1; fi\nexit 0\n")
+        fake.chmod(0o755)
+        old_path = os.environ["PATH"]
+        os.environ["PATH"] = f"{bindir}:{old_path}"
+        self.addCleanup(os.environ.__setitem__, "PATH", old_path)
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _FakeCdp)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.addCleanup(self.srv.server_close)
+        self.addCleanup(self.srv.shutdown)
+        self.cdp = f"http://127.0.0.1:{self.srv.server_address[1]}"
+        spec = importlib.util.spec_from_file_location("bvplugin", Path(bv_core.__file__).with_name("__init__.py"),
+                                                      submodule_search_locations=[str(Path(bv_core.__file__).parent)])
+        self.plugin = importlib.util.module_from_spec(spec)
+        sys.modules["bvplugin"] = self.plugin
+        self.addCleanup(sys.modules.pop, "bvplugin", None)
+        spec.loader.exec_module(self.plugin)
+
+    def calls(self):
+        return self.log.read_text().splitlines() if self.log.exists() else []
+
+    def test_use_sets_and_stop_clears_browser_cdp_url(self):
+        run = self.plugin.run_action
+        run({"action": "adopt", "name": "fx", "cdp_url": self.cdp})
+        run({"action": "use", "name": "fx"})
+        self.assertEqual(self.calls()[-1], f"config set browser.cdp_url {self.cdp}")
+        res = run({"action": "stop", "name": "fx"})
+        self.assertEqual(self.calls()[-1], "config unset browser.cdp_url")
+        self.assertIn("browser_exec", res)
+        self.assertNotIn("fx", self.plugin.bv_core.load_instances())
+
+    def test_if_clearing_browser_cdp_url_fails_the_browser_is_not_stopped(self):
+        run = self.plugin.run_action
+        run({"action": "adopt", "name": "fx", "cdp_url": self.cdp})
+        run({"action": "use", "name": "fx"})
+        self.fail_flag.write_text("")
+        with self.assertRaises(self.plugin.bv_core.ViewerError):
+            run({"action": "stop", "name": "fx"})
+        self.assertIn("fx", self.plugin.bv_core.load_instances(), "nothing may be stopped while browser_exec still points at it")
+        self.fail_flag.unlink()
+        run({"action": "stop", "name": "fx"})
+        self.assertNotIn("fx", self.plugin.bv_core.load_instances())
+
+    def test_names_are_validated_before_they_reach_a_link(self):
+        for bad in ("x&evil=1", "x#frag", "../x", "a b", "X"):
+            with self.assertRaises(self.plugin.bv_core.ViewerError, msg=bad):
+                self.plugin.run_action({"action": "link", "name": bad})
+            with self.assertRaises(self.plugin.bv_core.ViewerError, msg=bad):
+                self.plugin.run_action({"action": "rotate_token", "name": bad})
+
+    def test_status_never_returns_a_tab_path_or_query(self):
+        self.assertEqual(bv_core._origin("https://accounts.example.com/o/oauth2/auth?code=SECRET&state=x#frag"), "https://accounts.example.com")
+        self.assertEqual(bv_core._origin("http://127.0.0.1:9222/path?q=1"), "http://127.0.0.1:9222")
+        self.assertEqual(bv_core._origin("data:text/html,<h1>secret</h1>"), "data:")
+        self.assertEqual(bv_core._origin("about:blank"), "about:")
+        self.assertEqual(bv_core._origin("not a url"), "")
+
+    def test_purge_is_confined_to_the_profiles_directory(self):
+        outside = self.d / "precious"
+        outside.mkdir()
+        (outside / "keep.txt").write_text("x")
+        core = self.plugin.bv_core
+        core._save_instances({"fx": {"cdp": self.cdp, "port": int(self.cdp.rsplit(":", 1)[1]), "managed": False,
+                                     "pid": None, "profile": str(outside), "created": 0}})
+        core.stop_instance("fx", purge=True)
+        self.assertTrue((outside / "keep.txt").exists(), "purge must never delete a directory outside profiles/")
+        inside = core.home() / "profiles"
+        inside.mkdir(parents=True, exist_ok=True)
+        (inside / "gone").mkdir()
+        core._save_instances({"gy": {"cdp": self.cdp, "port": 1, "managed": False, "pid": None, "profile": str(inside / "gone"), "created": 0}})
+        core.stop_instance("gy", purge=True)
+        self.assertFalse((inside / "gone").exists())
+
+    def test_the_child_environment_carries_no_secrets(self):
+        os.environ["OPENAI_API_KEY"] = "sk-test-not-real"
+        self.addCleanup(os.environ.pop, "OPENAI_API_KEY", None)
+        env = bv_core._clean_env({"BROWSER_VIEWER_HOME": "/x"})
+        self.assertNotIn("OPENAI_API_KEY", env)
+        self.assertIn("PATH", env)
+        self.assertEqual(env["BROWSER_VIEWER_HOME"], "/x")
 
 
 if __name__ == "__main__":

@@ -77,6 +77,7 @@ class Stream:
         self.hold_timer: Optional[asyncio.TimerHandle] = None
         self.frames = 0
         self.bytes = 0
+        self.last: Optional[tuple] = None   # newest frame (w, h, jpeg): a window that joins later must not wait for the page to change
 
     @property
     def mode(self) -> str:
@@ -513,7 +514,17 @@ class Hub:
             c.offer(st.tid, (w, h, jpg))
         st.frames += 1
         st.bytes += len(jpg)
+        st.last = (w, h, jpg)
         return ready or not subs
+
+    def replay(self, c: "Client") -> None:
+        """Give a window that just joined (or changed its view) the newest frame we already have. A static page,
+        a login form for instance, produces no new frame on its own, so without this a reload shows a blank canvas."""
+        tids = list(self.streams) if c.view == "mosaic" else ([c.main_tid()] if c.main_tid() else [])
+        for tid in tids:
+            st = self.streams.get(tid)
+            if st and st.last:
+                c.offer(tid, st.last)
 
     def _on_cast_frame(self, st: Stream, p: Dict[str, Any]) -> None:
         md = p["metadata"]
@@ -560,7 +571,7 @@ class Hub:
             return
         t, sid = m.get("t"), st.sid
         quiet = time.monotonic() - c._main_at < INPUT_QUIET
-        if quiet and (t in ("key", "text") or (t == "mouse" and m.get("type") in ("mousePressed", "mouseReleased"))):
+        if quiet and (t in ("key", "text", "reload") or (t == "mouse" and m.get("type") in ("mousePressed", "mouseReleased"))):
             return      # the window just switched tabs by itself: what the user typed was meant for the previous page
         if t == "mouse" and m.get("type") in ("mousePressed", "mouseReleased", "mouseMoved", "mouseWheel"):
             p: Dict[str, Any] = dict(type=m["type"], x=num(m.get("x")), y=num(m.get("y")))
@@ -601,11 +612,24 @@ class Hub:
 
 
 # --------------------------------------------------------------------------- http layer
-SESSION_SECONDS = int(float(os.environ.get("BV_SESSION_HOURS", "168")) * 3600)   # how long a signed-in browser stays in
+def _session_seconds() -> int:
+    try:
+        return int(max(0.01, float(os.environ.get("BV_SESSION_HOURS", "168"))) * 3600)    # how long a signed-in browser stays in
+    except ValueError:
+        return 168 * 3600
+
+
+SESSION_SECONDS = _session_seconds()
+AUTH_RECHECK = float(os.environ.get("BV_AUTH_RECHECK", "5"))    # seconds between re-checks of the credential of an open stream
+
+
+def _b(s: str) -> bytes:
+    """Bytes of a string that came from the network: lone surrogates (non-UTF-8 input) must never raise."""
+    return s.encode("utf-8", "replace")
 
 
 def _sign(exp: int, nonce: str, master: str) -> str:
-    return hmac.new(master.encode(), f"{exp}.{nonce}".encode(), hashlib.sha256).hexdigest()
+    return hmac.new(_b(master), _b(f"{exp}.{nonce}"), hashlib.sha256).hexdigest()
 
 
 def make_session(master: str) -> str:
@@ -619,27 +643,65 @@ def session_ok(value: str, master: str) -> bool:
         exp = int(exp_s)
     except ValueError:
         return False
-    return exp > time.time() and secrets.compare_digest(sig.encode(), _sign(exp, nonce, master).encode())
+    return exp > time.time() and secrets.compare_digest(_b(sig), _b(_sign(exp, nonce, master)))
 
 
 def _authed(request: web.Request) -> bool:
-    """A signed session cookie (what the page uses), or the master token in ?k= / X-BV-Token (scripts, tests)."""
+    """A signed session cookie (what the page uses), or the master token in the X-BV-Token header (scripts, tests)."""
     master = request.app["token_fn"]()
     if not master:
         return False
     cookie = request.cookies.get(request.app["cookie_name"], "")
     if cookie and session_ok(cookie, master):
         return True
-    tok = request.query.get("k") or request.headers.get("X-BV-Token", "")
-    return bool(tok) and secrets.compare_digest(tok.encode(), master.encode())
+    tok = request.headers.get("X-BV-Token", "")
+    return bool(tok) and secrets.compare_digest(_b(tok), _b(master))
 
 
-def _origin_ok(request: web.Request) -> bool:
+def _origin_ok(request: web.Request, required: bool = False) -> bool:
+    """Browsers always send Origin on WebSocket and cross-origin requests: it must be exactly this server (scheme
+    and host). Non-browser clients send none, which only token-header clients may rely on (required=False)."""
     origin = request.headers.get("Origin")
     if not origin:
-        return True     # non-browser clients (tests, scripts) send none
-    host = request.headers.get("Host", "")
-    return origin.split("://", 1)[-1].rstrip("/") == host
+        return not required
+    return origin.rstrip("/") == f"{request.scheme}://{request.headers.get('Host', '')}"
+
+
+CSP = ("default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+       "img-src 'self' data: blob:; connect-src 'self' ws: wss:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+# No HSTS on purpose: it applies to the whole host name, every port, and could break other services on it.
+SECURITY_HEADERS = {"X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY", "Content-Security-Policy": CSP,
+                    "Referrer-Policy": "no-referrer", "Cross-Origin-Resource-Policy": "same-origin"}
+
+
+def _harden(resp: web.StreamResponse) -> None:
+    if not resp.prepared:
+        for k, v in SECURITY_HEADERS.items():
+            resp.headers.setdefault(k, v)
+
+
+@web.middleware
+async def guard(request: web.Request, handler):
+    """Refuse requests addressed to a host name this server does not serve (DNS rebinding), add security headers."""
+    host = request.headers.get("Host", "").rsplit(":", 1)[0].lower()
+    if host not in request.app["allowed_hosts"]:
+        raise web.HTTPMisdirectedRequest(text="unknown host")
+    try:
+        resp = await handler(request)
+    except web.HTTPException as exc:
+        _harden(exc)
+        raise
+    _harden(resp)
+    return resp
+
+
+async def _auth_guard(request: web.Request, ws: web.WebSocketResponse) -> None:
+    """An open stream must not outlive its credential: a rotated master secret or an expired cookie closes it."""
+    while not ws.closed:
+        await asyncio.sleep(AUTH_RECHECK)
+        if not _authed(request):
+            await ws.close(code=4401, message=b"signed out")
+            return
 
 
 async def index(request: web.Request) -> web.Response:
@@ -656,7 +718,7 @@ async def healthz(_request: web.Request) -> web.Response:
 
 async def session_login(request: web.Request) -> web.Response:
     """Exchange a one-time login token for an HttpOnly session cookie. Same-origin browser requests only."""
-    if not request.headers.get("Origin") or not _origin_ok(request):
+    if not _origin_ok(request, required=True):
         raise web.HTTPForbidden(text="origin")
     try:
         data = await request.json()
@@ -731,10 +793,12 @@ async def ws_handler(request: web.Request) -> web.StreamResponse:
         hub._close_timer = None
     app["seen"] = time.time()
     sender = asyncio.create_task(client.sender())
+    guard_task = asyncio.create_task(_auth_guard(request, ws))
     print(f"viewer: window opened on '{name}' ({len(hub.clients)} open)", flush=True)
     try:
         await client.send_json({"t": "hello", "instance": name, "instances": names, "levels": ORDER[1:]})
         await client.send_json(hub.tabs_msg())
+        hub.replay(client)
         hub.dirty.set()
         async for msg in ws:
             if msg.type != aiohttp.WSMsgType.TEXT:
@@ -756,12 +820,14 @@ async def ws_handler(request: web.Request) -> web.StreamResponse:
                 q = m.get("q")
                 client.q = q if q in ("low", "med", "high") else "auto"
                 client.note_main(False)
+                hub.replay(client)
                 hub.dirty.set()
             elif t in ("mouse", "key", "text", "reload"):
                 await hub.handle_input(client, m)
     finally:
         hub.clients.discard(client)
         sender.cancel()
+        guard_task.cancel()
         print(f"viewer: window closed on '{name}' ({len(hub.clients)} open)", flush=True)
         hub.dirty.set()
         if not hub.clients and not hub.closed:   # free the CDP connection when nobody watches
@@ -791,6 +857,7 @@ async def main() -> None:
     ap.add_argument("--cert")
     ap.add_argument("--key")
     ap.add_argument("--tls-name", help="host name the certificate covers; used in links")
+    ap.add_argument("--tls-name-host", help="the one --tls-host address that the certificate's name resolves to")
     a = ap.parse_args()
     if set(a.tls_host) - set(a.host):
         sys.exit("--tls-host must also be given as --host")
@@ -800,7 +867,7 @@ async def main() -> None:
             sys.exit("--tls-host needs --cert, --key and --tls-name")
         ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-        ssl_ctx.load_cert_chain(a.cert, a.key)
+        ssl_ctx.load_cert_chain(a.cert, a.key, password=lambda: b"")   # an encrypted key fails, it never prompts
     for h in a.host:
         try:
             wildcard = ipaddress.ip_address(h).is_unspecified
@@ -822,7 +889,8 @@ async def main() -> None:
         return token_cache["val"]
 
     bv_core.get_token()
-    app = web.Application()
+    app = web.Application(middlewares=[guard])
+    app["allowed_hosts"] = {h.lower() for h in a.host} | {"localhost"} | ({a.tls_name.lower()} if a.tls_name else set())
     app["token_fn"] = token
     app["cookie_name"] = f"bvs_{a.port}"      # cookies are not isolated by port, so the name carries it
     app["hubs"], app["hub_locks"], app["seen"] = {}, {}, time.time()
@@ -835,7 +903,7 @@ async def main() -> None:
         await web.TCPSite(runner, h, a.port, ssl_context=ssl_ctx if h in a.tls_host else None).start()
     info = {"pid": os.getpid(), "port": a.port, "hosts": a.host, "idle_minutes": a.idle, "started": int(time.time())}
     if a.tls_host:
-        info["tls"] = {"hosts": a.tls_host, "name": a.tls_name}
+        info["tls"] = {"hosts": a.tls_host, "name": a.tls_name, "name_host": a.tls_name_host}
     sj = bv_core.home() / "server.json"
     bv_core._write_private(sj, json.dumps(info))
     print(f"viewer: listening on {', '.join(f'{h}:{a.port}' + (' (https)' if h in a.tls_host else '') for h in a.host)}", flush=True)

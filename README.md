@@ -63,6 +63,7 @@ The setting takes effect when the server next starts. Every address except loopb
 | `BV_START_TIMEOUT` | seconds to wait for a new Chromium | `15` |
 | `BV_CLOSE_GRACE` | seconds an empty hub keeps its CDP connection | `20` |
 | `BV_SESSION_HOURS` | how long a signed-in browser stays signed in | `168` (7 days) |
+| `BV_AUTH_RECHECK` | seconds between re-checks of the credential of an open stream | `5` |
 | `BROWSER_VIEWER_HOME` | override of the data directory (the plugin sets it for its own server process; useful for tests) | the plugin data dir of the active profile |
 
 State lives in the plugin data directory (`<hermes home>/plugin-data/browser-viewer/`): browser registry, profiles, master secret, pending login tokens, logs.
@@ -71,12 +72,13 @@ State lives in the plugin data directory (`<hermes home>/plugin-data/browser-vie
 
 - Whoever holds the link controls a browser that may be logged in to your accounts. Treat the link like a password.
 - A link carries a one-time login token (192 random bits, valid 10 minutes). The page sends it with a same-origin `POST /api/session` and receives an `HttpOnly; SameSite=Strict` session cookie (named after the server port, 7 days by default). Merely opening or prefetching the URL does not use the token up, only that POST does; the token is then removed from the address bar. Only its SHA-256 is stored on the server, in a `0700` directory, and consuming it is an atomic file removal, so two simultaneous requests cannot both succeed.
-- The cookie is an HMAC-SHA256 signature over its expiry, keyed with a master secret kept in a `0600` file. The master secret never appears in a link, a page or a tool result. Rotating it (`rotate_token`, `token --rotate`) signs every browser out at once and drops login links that were not used yet, without restarting the server. Scripts can still present the master secret as `X-BV-Token`.
-- The cookie carries the `Secure` flag whenever it is served over HTTPS.
+- The cookie is an HMAC-SHA256 signature over its expiry, keyed with a master secret kept in a `0600` file. The master secret never appears in a link, a page or a tool result. Rotating it (`rotate_token`, `token --rotate`) signs every browser out and drops login links that were not used yet, without restarting the server. An open stream is re-checked every few seconds (`BV_AUTH_RECHECK`) and is closed as soon as its cookie has expired or the secret has changed, so a signed-out browser stops receiving frames within seconds. Scripts can present the master secret in the `X-BV-Token` header; it is not accepted in a URL.
+- The cookie carries the `Secure` flag on every address served over HTTPS (not on loopback, which stays plain HTTP).
 - The WebSocket and the stats endpoint need the cookie (or the master secret). The static page is served without either and contains no secret.
-- The CDP port of every browser listens on `127.0.0.1` only. Adopted browsers must be loopback endpoints, and the plugin never kills a browser it did not start.
-- Cross-origin WebSocket connections are refused (`Origin` must match `Host`).
-- Input is accepted only for the tab a client is viewing, and is dropped for 0.8 s after a tab change the user did not ask for.
+- Managed browsers open their CDP port on `127.0.0.1` only, and a new one is registered only if the debug port is held by the process the plugin just started. Adopted browsers must be loopback endpoints (the plugin can enforce where it connects, not what they listen on), and the plugin never kills a browser it did not start.
+- Requests must be addressed to a host name this server serves (its listening addresses, the certificate's name, `localhost`); anything else gets `421`, which defeats DNS rebinding. Login and WebSocket requests that carry an `Origin` must match this server's scheme and host exactly; only clients using the token header may omit it.
+- Pages and errors carry `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` and a Content-Security-Policy that allows only the page's own script and style and forbids framing. There is no HSTS on purpose: it would pin the whole host name, every port.
+- Input is accepted only for the tab a client is viewing. Keys, text, mouse clicks and reloads are dropped for 0.8 s after a tab change the user did not ask for; pointer moves and the wheel are not.
 - Before killing a managed browser the plugin checks that the registered pid still has the recorded start time and the expected `--user-data-dir`, so a recycled pid is never signalled.
 - Purging a profile is limited to directories directly under the plugin's `profiles/`.
 
@@ -85,23 +87,29 @@ State lives in the plugin data directory (`<hermes home>/plugin-data/browser-vie
 What you should know before installing:
 
 - **Network.** Starts an HTTP/WebSocket server (aiohttp) that listens on the explicit IPv4 addresses above. It speaks plain HTTP unless you enable HTTPS: on a Tailscale network WireGuard encrypts plain HTTP, on any other network it is not encrypted. The plugin makes no outbound network calls of its own and talks to Chromium over `http://127.0.0.1`. The only exception is the opt-in `tls tailscale`, which runs `tailscale cert`: that contacts the Tailscale control plane and Let's Encrypt, and the machine's MagicDNS name appears in public Certificate Transparency logs. The certificate's private key is stored in a `0600` file in the plugin data directory.
-- **Credentials.** Managed browsers keep a persistent profile on disk, including cookies and logins, under the plugin data dir. The token file lives in the same directory.
+- **Credentials.** Managed browsers keep a persistent profile on disk, including cookies and logins, under the plugin data dir. The master secret lives in the same directory. The server and Chromium start with a minimal environment (PATH, HOME, locale, display and proxy variables), not the environment of the Hermes process, so API keys held there are not inherited.
 - **Shell commands.** Launches Chromium (`--remote-debugging-port` on loopback, `--user-data-dir=<profile>`), runs `chromium --version` to pick a binary at least as recent as the one that created a profile, runs `tailscale ip -4` to find the Tailscale address, `tailscale status --json` and `tailscale cert` when HTTPS is enabled with `tls tailscale`, and runs `hermes config set|unset browser.cdp_url` when you use `use` or `stop`.
-- **Global setting.** `use` writes `browser.cdp_url`, which makes every Hermes session of that profile (other chats, cron jobs) drive that browser until cleared. `stop` clears it if it points at the stopped browser.
+- **Global setting.** `use` writes `browser.cdp_url`, which makes every Hermes session of that profile (other chats, cron jobs) drive that browser until cleared, and `browser_exec` then acts with every login that browser holds. That is the point of `use`, and the tool description says it must only be called when the user asks. `stop` clears the setting first and stops the browser only if that worked. `hermes config` runs without an extra approval step, as a direct consequence of the action you asked for.
 - **Background processes.** The streaming server is a detached process that outlives Hermes sessions and exits by itself after the idle timeout. Managed Chromium processes keep running until stopped.
 - **Reads outside its own data.** `/proc/<pid>` for process identity, and the Chromium builds Hermes installed under `<hermes home>/tools/`.
 - **Local CDP access.** Any CDP client on the same machine, Hermes included, can read what is in a page, password fields included. This plugin does not add that exposure, but it is why you should keep the host single-user.
 - **Links in the tool result.** `start` and `link` return login links. They work once and expire after 10 minutes, so a transcript does not hold anything reusable once a link has been used or has expired.
 - **Plain HTTP unless you enable HTTPS.** Without `tls`, the session cookie has no `Secure` flag and neither it nor the stream is encrypted on the wire. On a Tailscale network WireGuard encrypts everything; on any other network enable `tls` or do not expose the port.
-- **Telemetry.** None.
+- **What the agent sees.** `status` and `list` return, for each tab of the registered browsers, its origin (scheme and host, never path or query) and a title cut to 60 characters. They land in the session transcript.
+- **Chromium's own traffic.** The browser is a regular, unmodified Chromium. Besides what the opened pages need it makes the background connections Chromium normally makes (the logs show, for example, Google's push messaging). The plugin neither adds nor hides any of it.
+- **Telemetry.** None from the plugin.
 
 ## Known limitations
 
-- HTTPS is opt-in, and the certificate is only refreshed when the server starts: a server kept running past the certificate's expiry keeps serving the old one (it exits after 60 idle minutes by default).
+- HTTPS is opt-in, and the certificate is only refreshed when the server starts: a server kept running past the certificate's expiry keeps serving the old one (it exits after 60 idle minutes by default). If Tailscale cannot be reached at start, the certificate on disk is reused with a warning as long as it has not expired; the server never falls back to plain HTTP on a TLS address.
 - No per-device session list: a session lasts until it expires or the master secret is rotated, and rotating signs every browser out.
 - Frame rate and bandwidth were measured on loopback with simulated delay, not on real WAN links.
 - On a phone in portrait the remote page (1280 px wide) is scaled to about a third, so fields are small. Landscape is much more comfortable.
-- The tool handler is synchronous: a cold start can block for up to about 75 seconds (15 s for Chromium plus up to 60 s for the server).
+- The tool handler is synchronous: a cold start can block for up to about 75 seconds (15 s for Chromium plus up to 60 s for the server), more if `hermes config` is slow (30 s) or `tls tailscale` has to ask Tailscale for a certificate (up to 130 s).
+- Cookies are not scoped by port: on the same host name another service on a different port receives the viewer's cookie. Its name carries the port and the value is signed and `HttpOnly`, so it is useless to that service, but it is sent.
+- After the 0.8 s quiet window, keystrokes go to the tab the agent opened. A click is not required first.
+- With two windows on different tabs of a browser that has a real window (not headless), tab activation for streaming can alternate; headless browsers are not affected. Tab activations done by the agent itself are not tracked.
+- `tls` keys must not be passphrase-protected, and on Linux `tailscale cert` needs root or your user set as Tailscale operator (`tailscale set --operator=$USER`, once, as root).
 - Not tested on Windows clients with non-US keyboard layouts beyond AltGr handling.
 
 ## Development

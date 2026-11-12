@@ -32,6 +32,7 @@ import time
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote, urlsplit
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 DEFAULT_SERVER_PORT = 9281   # 9280 is left to the legacy login-viewer
@@ -126,6 +127,28 @@ def cdp_alive(cdp: str) -> bool:
         return bool(http_json(cdp + "/json/version", 1.5).get("webSocketDebuggerUrl"))
     except Exception:
         return False
+
+
+def _origin(url: str) -> str:
+    """Scheme and host of a tab, never its path or query (which can carry codes and reset links)."""
+    try:
+        u = urlsplit(str(url))
+    except ValueError:
+        return ""
+    return f"{u.scheme}://{u.netloc}" if u.scheme in ("http", "https") and u.netloc else (f"{u.scheme}:" if u.scheme else "")
+
+
+_ENV_KEEP = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "XDG_RUNTIME_DIR",
+             "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY",
+             "DBUS_SESSION_BUS_ADDRESS", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+             "http_proxy", "https_proxy", "no_proxy", "all_proxy")
+
+
+def _clean_env(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """What a child process gets: the basics a browser needs, not the API keys and tokens of the Hermes process."""
+    env = {k: v for k, v in os.environ.items() if k in _ENV_KEEP or k.startswith(("BV_", "BROWSER_VIEWER_"))}
+    env.update(extra or {})
+    return env
 
 
 def cdp_tabs(cdp: str) -> List[Dict[str, Any]]:
@@ -263,12 +286,38 @@ def instance_info(name: str, inst: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "name": name, "cdp": inst["cdp"], "managed": bool(inst.get("managed")), "alive": alive,
         "pid": inst.get("pid"), "profile": inst.get("profile"),
-        "tabs": [{"url": t.get("url", ""), "title": t.get("title", "")} for t in cdp_tabs(inst["cdp"])] if alive else [],
+        "tabs": [{"origin": _origin(t.get("url", "")), "title": str(t.get("title") or "")[:60]} for t in cdp_tabs(inst["cdp"])] if alive else [],
     }
 
 
 def list_instances() -> List[Dict[str, Any]]:
     return [instance_info(n, i) for n, i in sorted(load_instances().items())]
+
+
+def _owns_port(port: int, pid: int) -> bool:
+    """True if the process we started holds the listening socket on `port`, not a stranger that got there first."""
+    inodes = set()
+    for fam in ("tcp", "tcp6"):
+        try:
+            rows = Path(f"/proc/net/{fam}").read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for row in rows:
+            f = row.split()
+            if len(f) > 9 and f[3] == "0A" and int(f[1].rsplit(":", 1)[1], 16) == port:     # 0A = LISTEN
+                inodes.add(f[9])
+    if not inodes:
+        return False
+    try:
+        with os.scandir(f"/proc/{pid}/fd") as fds:
+            for fd in fds:
+                with contextlib.suppress(OSError):
+                    tgt = os.readlink(fd.path)
+                    if tgt.startswith("socket:[") and tgt[8:-1] in inodes:
+                        return True
+    except OSError:
+        return False
+    return False
 
 
 def start_instance(name: str, url: str = "about:blank", port: Optional[int] = None, headless: bool = True,
@@ -306,7 +355,8 @@ def start_instance(name: str, url: str = "about:blank", port: Optional[int] = No
             args.append("--headless=new")
         args.append(url)
         with open(home() / f"chromium-{name}.log", "ab") as log:
-            proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)  # noqa: S603
+            proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,  # noqa: S603
+                                    env=_clean_env())
         cdp = f"http://127.0.0.1:{port}"
         err = None
         deadline = time.monotonic() + START_TIMEOUT
@@ -314,7 +364,7 @@ def start_instance(name: str, url: str = "about:blank", port: Optional[int] = No
             if proc.poll() is not None:     # checked first: an answer on the port must come from OUR process
                 err = f"Chromium exited immediately (code {proc.returncode}); see chromium-{name}.log"
                 break
-            if cdp_alive(cdp):
+            if cdp_alive(cdp) and _owns_port(port, proc.pid):    # the answer must come from OUR browser
                 break
             time.sleep(0.15)
         else:
@@ -408,7 +458,7 @@ def new_bootstrap(ttl: int = BOOTSTRAP_TTL) -> str:
             if float(f.read_text()) < now:
                 f.unlink()
     tok = secrets.token_urlsafe(24)
-    _write_private(d / hashlib.sha256(tok.encode()).hexdigest(), str(now + ttl))
+    _write_private(d / hashlib.sha256(tok.encode("utf-8", "replace")).hexdigest(), str(now + ttl))
     return tok
 
 
@@ -417,7 +467,7 @@ def consume_bootstrap(tok: str) -> bool:
     simultaneous requests only one can remove it."""
     if not isinstance(tok, str) or not tok or len(tok) > 200:
         return False
-    p = _bootstrap_dir() / hashlib.sha256(tok.encode()).hexdigest()
+    p = _bootstrap_dir() / hashlib.sha256(tok.encode("utf-8", "replace")).hexdigest()
     try:
         expires = float(p.read_text())
         p.unlink()
@@ -499,7 +549,10 @@ def _tailscale_cert() -> Dict[str, str]:
     if not exe:
         raise ViewerError("tailscale is not installed")
     try:
-        st = json.loads(subprocess.run([exe, "status", "--json"], capture_output=True, text=True, timeout=10).stdout)  # noqa: S603
+        r = subprocess.run([exe, "status", "--json"], capture_output=True, text=True, timeout=10)  # noqa: S603
+        if r.returncode != 0:
+            raise ViewerError("tailscale status failed: " + (r.stderr or r.stdout).strip()[:200])
+        st = json.loads(r.stdout)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         raise ViewerError(f"cannot read the Tailscale status: {type(exc).__name__}") from exc
     name = ((st.get("Self") or {}).get("DNSName") or "").rstrip(".").lower()
@@ -519,10 +572,19 @@ def _tailscale_cert() -> Dict[str, str]:
     except (OSError, subprocess.SubprocessError) as exc:
         raise ViewerError(f"tailscale cert did not finish: {type(exc).__name__}") from exc
     if r.returncode != 0:
-        raise ViewerError("tailscale cert failed: " + (r.stderr or r.stdout).strip()[:200])
+        raise ViewerError("tailscale cert failed: " + (r.stderr or r.stdout).strip()[:200]
+                          + " (on Linux, `tailscale cert` needs root or your user set as the Tailscale operator: see `tailscale set --help`)")
     with contextlib.suppress(OSError):
         os.chmod(key, 0o600)
     return {"mode": "tailscale", "name": name, "cert": str(cert), "key": str(key)}
+
+
+def _cert_days_left(cert: str) -> Optional[float]:
+    """Days until the certificate expires, or None when it cannot be read."""
+    try:
+        return (ssl.cert_time_to_seconds(ssl._ssl._test_decode_cert(cert)["notAfter"]) - time.time()) / 86400  # noqa: SLF001
+    except Exception:  # noqa: BLE001 - an unreadable date is "unknown", not an error
+        return None
 
 
 def set_tls(mode: str, cert: Optional[str] = None, key: Optional[str] = None, name: Optional[str] = None) -> Dict[str, Any]:
@@ -530,7 +592,11 @@ def set_tls(mode: str, cert: Optional[str] = None, key: Optional[str] = None, na
     (your own certificate and key for NAME) or off (plain HTTP). Takes effect when the server next starts."""
     tls_file = home() / "tls.json"
     if mode == "off":
+        old = tls_settings()
         tls_file.unlink(missing_ok=True)
+        if old and old.get("mode") == "tailscale":      # our own copy of the key; a "files" key is yours, never touched
+            for f in (home() / "tls").glob("*.pem"):
+                f.unlink(missing_ok=True)
         return {"tls": "off"}
     if mode == "tailscale":
         rec = _tailscale_cert()
@@ -540,7 +606,7 @@ def set_tls(mode: str, cert: Optional[str] = None, key: Optional[str] = None, na
             raise ViewerError("files mode needs a certificate, a key and the host name the certificate covers (--name)")
         cert_p, key_p = Path(cert).expanduser().resolve(), Path(key).expanduser().resolve()
         try:
-            ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(cert_p, key_p)
+            ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(cert_p, key_p, password=lambda: b"")
         except (OSError, ssl.SSLError) as exc:
             raise ViewerError(f"cannot load the certificate and key: {exc}") from exc
         rec = {"mode": "files", "name": name, "cert": str(cert_p), "key": str(key_p)}
@@ -548,6 +614,14 @@ def set_tls(mode: str, cert: Optional[str] = None, key: Optional[str] = None, na
         raise ViewerError(f"unknown tls mode: {mode!r} (tailscale, files, off)")
     _write_private(tls_file, json.dumps(rec))
     return {"tls": mode, "name": rec["name"], "note": "applies the next time the server starts (hermes browser-viewer stop --server)"}
+
+
+def _last_log_line() -> str:
+    try:
+        lines = [l.strip() for l in (home() / "server.log").read_text(errors="replace").splitlines() if l.strip()]
+    except OSError:
+        return "see server.log"
+    return (lines[-1][:200] if lines else "see server.log")
 
 
 def start_server(port: int = DEFAULT_SERVER_PORT, hosts: Optional[List[str]] = None, idle_minutes: int = 60) -> Dict[str, Any]:
@@ -567,21 +641,35 @@ def start_server(port: int = DEFAULT_SERVER_PORT, hosts: Optional[List[str]] = N
     for h in hosts:
         cmd += ["--host", h]
     tls = tls_settings()
-    if tls:         # HTTPS on every address except loopback, which stays plain HTTP (a secure context for browsers anyway)
+    warnings: List[str] = []
+    # HTTPS on every address except loopback, which stays plain HTTP (a secure context for browsers anyway)
+    tls_hosts = [h for h in hosts if not ipaddress.ip_address(h).is_loopback] if tls else []
+    if tls and tls_hosts:
         if tls["mode"] == "tailscale":
-            tls = _tailscale_cert()
-            _write_private(home() / "tls.json", json.dumps(tls))
-        for h in hosts:
-            if not ipaddress.ip_address(h).is_loopback:
-                cmd += ["--tls-host", h]
+            try:
+                tls = _tailscale_cert()                 # no-op while valid, renews when close to expiry
+                _write_private(home() / "tls.json", json.dumps(tls))
+            except ViewerError as exc:                  # a Tailscale hiccup must not lock you out of a certificate you have
+                left = _cert_days_left(tls["cert"])
+                if not (Path(tls["cert"]).is_file() and Path(tls["key"]).is_file()) or (left is not None and left <= 0):
+                    raise
+                warnings.append(f"could not refresh the Tailscale certificate ({exc}); serving the one on disk"
+                                + (f", {left:.0f} days left" if left is not None else ""))
+        for h in tls_hosts:
+            cmd += ["--tls-host", h]
         cmd += ["--cert", tls["cert"], "--key", tls["key"], "--tls-name", tls["name"]]
-    env = dict(os.environ, BROWSER_VIEWER_HOME=str(home()))
+        ts = tailscale_ip() if tls["mode"] == "tailscale" else None
+        if ts in tls_hosts:
+            cmd += ["--tls-name-host", ts]
     with open(home() / "server.log", "ab") as log:  # the child keeps its own copy of the descriptor
-        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True, env=env)  # noqa: S603
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,  # noqa: S603
+                                env=_clean_env({"BROWSER_VIEWER_HOME": str(home())}))
     for _ in range(300):  # up to 60 s
         info = server_info()
         if info:
-            return {**info, "reused": False}
+            return {**info, "reused": False, **({"warnings": warnings} if warnings else {})}
+        if proc.poll() is not None:                     # it died: say why now, not after a minute
+            raise ViewerError(f"the server exited with code {proc.returncode}: {_last_log_line()}")
         time.sleep(0.2)
     raise ViewerError("the server did not start: see server.log in the plugin data directory")
 
@@ -627,12 +715,19 @@ def links(instance: Optional[str] = None) -> List[str]:
     # one single-use login token per link: opening it signs that browser in with a session cookie.
     # Addresses served with TLS are reached by the certificate's host name, the others by IP over plain HTTP.
     tls = info.get("tls") or {}
+    if instance:
+        check_name(instance)
     out: List[str] = []
     for h in info.get("hosts", []):
-        base = f"https://{tls['name']}:{info['port']}" if h in tls.get("hosts", []) else f"http://{h}:{info['port']}"
+        if h in tls.get("hosts", []):
+            # the certificate's name only reaches the address it resolves to; another TLS address is reached by IP
+            on_name = not tls.get("name_host") or tls.get("name_host") == h
+            base = f"https://{tls['name'] if on_name else h}:{info['port']}"
+        else:
+            base = f"http://{h}:{info['port']}"
         if base not in out:
             out.append(base)
-    return [f"{b}/?b={new_bootstrap()}" + (f"&i={instance}" if instance else "") for b in out]
+    return [f"{b}/?b={new_bootstrap()}" + (f"&i={quote(instance, safe='')}" if instance else "") for b in out]
 
 
 def status() -> Dict[str, Any]:

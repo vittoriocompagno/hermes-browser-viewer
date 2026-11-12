@@ -1,1 +1,0 @@
-cert --cert-file /home/warden/.hermes/cache/scratch/bv-tlsset-z_kl9aet/home/tls/cert.pem --key-file /home/warden/.hermes/cache/scratch/bv-tlsset-z_kl9aet/home/tls/key.pem box.test.ts.net

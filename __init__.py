@@ -97,6 +97,8 @@ def _links_payload(name: str | None) -> Dict[str, Any]:
 def run_action(args: Dict[str, Any]) -> Dict[str, Any]:
     action = str(args.get("action", "")).strip()
     name = (args.get("name") or "").strip() or None
+    if name:
+        bv_core.check_name(name)
     if action not in ACTIONS:
         raise bv_core.ViewerError(f"unknown action: {action!r} (valid: {', '.join(ACTIONS)})")
 
@@ -113,6 +115,8 @@ def run_action(args: Dict[str, Any]) -> Dict[str, Any]:
         if action == "start" or not bv_core.server_info():
             srv = bv_core.start_server()
             out["server"] = {"port": srv["port"], "hosts": srv["hosts"], "reused": srv.get("reused", False)}
+            if srv.get("warnings"):
+                out["warnings"] = srv["warnings"]
         out.update(_links_payload(n))
         out["next"] = ("when the user has finished logging in, use action='use' to make browser_exec drive this browser "
                        "(then open a new browser_exec session)")
@@ -151,11 +155,14 @@ def run_action(args: Dict[str, Any]) -> Dict[str, Any]:
         if not name:
             raise bv_core.ViewerError("the name of the browser to stop is required (or what='server')")
         cdp = (bv_core.load_instances().get(name) or {}).get("cdp")
-        res = bv_core.stop_instance(name, purge=bool(args.get("purge")))
-        if cdp and cdp == bv_core.cdp_in_use():     # browser_exec must not be left pointing at a dead endpoint
-            res["browser_exec"] = "back to the default clean browser (browser.cdp_url removed)"
-            _set_cdp_url(None)
+        cleared = False
+        if cdp and cdp == bv_core.cdp_in_use():     # browser_exec must not be left pointing at a dead endpoint:
+            _set_cdp_url(None)                      # clear first, so a failure here stops nothing and leaves nothing dangling
             bv_core.set_cdp_in_use(None)
+            cleared = True
+        res = bv_core.stop_instance(name, purge=bool(args.get("purge")))
+        if cleared:
+            res["browser_exec"] = "back to the default clean browser (browser.cdp_url removed)"
         return res
 
     if action == "rotate_token":
@@ -219,6 +226,8 @@ def _cli(args) -> None:
         for k in ("warning", "note", "next"):
             if res.get(k):
                 print(f"\n{k}: {res[k]}")
+        for w in res.get("warnings", []):
+            print(f"\nwarning: {w}")
         return
     print(_fmt(res))
 
