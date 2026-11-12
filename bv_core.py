@@ -117,8 +117,13 @@ def _loopback_url(url: str) -> str:
     return f"http://{m.group(1)}:{m.group(2)}"
 
 
+# Every probe of ours is local (a browser's CDP port, our own server): it must never be handed to a proxy that
+# http_proxy / https_proxy name, which would see the request and could not reach 127.0.0.1 anyway.
+_LOCAL = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def http_json(url: str, timeout: float = 2.0) -> Any:
-    with urllib.request.urlopen(url, timeout=timeout) as r:  # noqa: S310 - loopback or own server only
+    with _LOCAL.open(url, timeout=timeout) as r:  # noqa: S310 - loopback or own server only
         return json.loads(r.read().decode())
 
 
@@ -133,15 +138,19 @@ def _origin(url: str) -> str:
     """Scheme and host of a tab, never its path or query (which can carry codes and reset links)."""
     try:
         u = urlsplit(str(url))
+        host, port = u.hostname, u.port        # never netloc: it carries user:password@
     except ValueError:
         return ""
-    return f"{u.scheme}://{u.netloc}" if u.scheme in ("http", "https") and u.netloc else (f"{u.scheme}:" if u.scheme else "")
+    if u.scheme in ("http", "https") and host:
+        return f"{u.scheme}://" + (f"[{host}]" if ":" in host else host) + (f":{port}" if port else "")
+    return f"{u.scheme}:" if u.scheme else ""
 
 
 _ENV_KEEP = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR", "XDG_RUNTIME_DIR",
              "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY",
-             "DBUS_SESSION_BUS_ADDRESS", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
-             "http_proxy", "https_proxy", "no_proxy", "all_proxy")
+             "DBUS_SESSION_BUS_ADDRESS", "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "XDG_SESSION_DESKTOP",
+             "DESKTOP_SESSION", "XDG_DATA_DIRS", "XDG_CONFIG_DIRS", "SSL_CERT_FILE", "SSL_CERT_DIR",
+             "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "no_proxy", "all_proxy")
 
 
 def _clean_env(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -294,29 +303,49 @@ def list_instances() -> List[Dict[str, Any]]:
     return [instance_info(n, i) for n, i in sorted(load_instances().items())]
 
 
-def _owns_port(port: int, pid: int) -> bool:
-    """True if the process we started holds the listening socket on `port`, not a stranger that got there first."""
-    inodes = set()
-    for fam in ("tcp", "tcp6"):
-        try:
-            rows = Path(f"/proc/net/{fam}").read_text().splitlines()[1:]
-        except OSError:
-            continue
-        for row in rows:
-            f = row.split()
-            if len(f) > 9 and f[3] == "0A" and int(f[1].rsplit(":", 1)[1], 16) == port:     # 0A = LISTEN
-                inodes.add(f[9])
-    if not inodes:
-        return False
+def _session_pids(sid: int) -> List[int]:
+    """Processes of the session we started with start_new_session: a wrapper that forks still counts as ours."""
+    out = []
     try:
-        with os.scandir(f"/proc/{pid}/fd") as fds:
-            for fd in fds:
-                with contextlib.suppress(OSError):
-                    tgt = os.readlink(fd.path)
-                    if tgt.startswith("socket:[") and tgt[8:-1] in inodes:
-                        return True
+        entries = [d.name for d in Path("/proc").iterdir() if d.name.isdigit()]
+    except OSError:
+        return [sid]
+    for name in entries:
+        try:
+            stat = Path(f"/proc/{name}/stat").read_text()
+            fields = stat[stat.rindex(")") + 2:].split()      # comm may contain spaces and parentheses
+            if int(fields[3]) == sid:                         # field 6 of the line is the session id
+                out.append(int(name))
+        except (OSError, ValueError, IndexError):
+            continue
+    return out or [sid]
+
+
+def _owns_port(port: int, pid: int) -> bool:
+    """True if a process we started holds the listening socket on 127.0.0.1:`port`, not a stranger that got there
+    first. Only the IPv4 loopback row counts: that is the address we connect to, and a Chromium that lost the
+    IPv4 address to a stranger falls back to [::1], which must not vouch for the stranger's answer."""
+    inodes = set()
+    try:
+        rows = Path("/proc/net/tcp").read_text().splitlines()[1:]
     except OSError:
         return False
+    for row in rows:
+        f = row.split()
+        if len(f) > 9 and f[3] == "0A" and f[1].upper() == f"0100007F:{port:04X}":      # 0A = LISTEN
+            inodes.add(f[9])
+    if not inodes:
+        return False
+    for p in _session_pids(pid):
+        try:
+            with os.scandir(f"/proc/{p}/fd") as fds:
+                for fd in fds:
+                    with contextlib.suppress(OSError):
+                        tgt = os.readlink(fd.path)
+                        if tgt.startswith("socket:[") and tgt[8:-1] in inodes:
+                            return True
+        except OSError:
+            continue
     return False
 
 
@@ -513,7 +542,8 @@ def server_info() -> Optional[Dict[str, Any]]:
         h = "127.0.0.1" if "127.0.0.1" in hosts else hosts[0]
         if h in tls_hosts:      # liveness probe of our own server: the certificate names a host, not this IP
             url, ctx = f"https://{h}:{info['port']}/healthz", ssl._create_unverified_context()  # noqa: S323
-            with urllib.request.urlopen(url, timeout=1.5, context=ctx) as r:  # noqa: S310
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=ctx))
+            with opener.open(url, timeout=1.5) as r:  # noqa: S310
                 json.loads(r.read().decode())
         else:
             http_json(f"http://{h}:{info['port']}/healthz", 1.5)
@@ -640,6 +670,11 @@ def start_server(port: int = DEFAULT_SERVER_PORT, hosts: Optional[List[str]] = N
     cmd = _python_cmd() + [str(Path(__file__).with_name("bv_server.py")), "--port", str(int(port)), "--idle", str(int(idle_minutes))]
     for h in hosts:
         cmd += ["--host", h]
+    for n in os.environ.get("BV_ALLOWED_HOSTS", "").split(","):
+        if n.strip():
+            if not HOSTNAME_RE.fullmatch(n.strip().lower()):
+                raise ViewerError(f"invalid host name in BV_ALLOWED_HOSTS: {n.strip()!r}")
+            cmd += ["--allow-host", n.strip().lower()]
     tls = tls_settings()
     warnings: List[str] = []
     # HTTPS on every address except loopback, which stays plain HTTP (a secure context for browsers anyway)
@@ -680,7 +715,9 @@ def stop_server() -> Dict[str, Any]:
         pid = int(info["pid"])
     except (OSError, ValueError, KeyError, TypeError):
         return {"stopped": False, "note": "server not running"}
-    if not _pid_alive(pid) or not re.search(r"bv_server\.py(?:\s|$)", " ".join(_proc_args(pid))):
+    started = info.get("starttime")
+    if (not _pid_alive(pid) or not re.search(r"bv_server\.py(?:\s|$)", " ".join(_proc_args(pid)))
+            or (started and _proc_start(pid) != started)):
         with contextlib.suppress(OSError):
             (home() / "server.json").unlink()
         return {"stopped": False, "note": "server not running"}

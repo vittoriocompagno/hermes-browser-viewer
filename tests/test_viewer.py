@@ -34,6 +34,7 @@ os.environ["BROWSER_VIEWER_HOME"] = TMP
 os.environ["BV_CLOSE_GRACE"] = "1"
 os.environ["BV_AUTH_RECHECK"] = "0.5"      # open streams re-check their credential twice a second (5 s in real life)
 atexit.register(shutil.rmtree, TMP, True)
+os.environ["TMPDIR"] = TMP                 # Chromium's own temp dirs land here too, and go with it
 import bv_core  # noqa: E402
 
 PORT = 9391
@@ -170,6 +171,14 @@ async def until(cond, timeout=6.0, step=0.05):
     return False
 
 
+def free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
 def tok_header(token=None):
     return {"X-BV-Token": token or bv_core.get_token()}
 
@@ -203,7 +212,6 @@ class ViewerTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
         # cleanups are registered as each resource appears, so a failure half-way still tears everything down
-        cls.addClassCleanup(shutil.rmtree, TMP, True)
         cls.inst = bv_core.start_instance("t1", size="1024,700")
         cls.addClassCleanup(_stop_instance, "t1")
         cls.inst2 = bv_core.start_instance("t2", size="800,600")
@@ -258,12 +266,12 @@ class ViewerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_open_stream_is_closed_when_the_session_cookie_expires(self):
         import bv_server
-        exp = int(time.time()) + 2
+        exp = int(time.time()) + 4
         cookie = f"{exp}.n.{bv_server._sign(exp, 'n', bv_core.get_token())}"
         async with aiohttp.ClientSession() as s:
-            ws = await s.ws_connect(f"{BASE}/ws?i=t1", headers={"Cookie": f"bvs_{PORT}={cookie}"})
+            ws = await s.ws_connect(f"{BASE}/ws?i=t1", headers={"Cookie": f"bvs_{PORT}={cookie}", "Origin": BASE})
             self.assertEqual((await ws.receive(timeout=5)).type, aiohttp.WSMsgType.TEXT)
-            self.assertTrue(await self._until_closed(ws), "an expired session kept streaming")
+            self.assertTrue(await self._until_closed(ws, timeout=12), "an expired session kept streaming")
             self.assertEqual(ws.close_code, 4401)
 
     async def test_origin_must_match_scheme_and_host_and_the_host_must_be_one_we_serve(self):
@@ -279,6 +287,79 @@ class ViewerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(cm.exception.status, 403, origin)
             ok = await s.post(f"{BASE}/api/session", json={"b": bv_core.new_bootstrap()}, headers={"Origin": BASE})
             self.assertEqual(ok.status, 200)
+
+    async def test_a_cookie_websocket_without_an_origin_is_refused(self):
+        async with self._jar_session() as s:
+            r = await s.post(f"{BASE}/api/session", json={"b": bv_core.new_bootstrap()}, headers={"Origin": BASE})
+            self.assertEqual(r.status, 200)
+            with self.assertRaises(aiohttp.WSServerHandshakeError) as cm:     # a browser always sends Origin: a client that does not is no browser
+                await s.ws_connect(f"{BASE}/ws?i=t1")
+            self.assertEqual(cm.exception.status, 403)
+            ws = await s.ws_connect(f"{BASE}/ws?i=t1", headers={"Origin": BASE})
+            self.assertEqual((await ws.receive(timeout=5)).type, aiohttp.WSMsgType.TEXT)
+            await ws.close()
+
+    async def test_the_421_has_the_security_headers_and_host_spellings_are_handled(self):
+        async with aiohttp.ClientSession() as s:
+            r = await s.get(f"{BASE}/healthz", headers={"Host": "evil.example"})
+            self.assertEqual(r.status, 421)
+            self.assertEqual(r.headers.get("X-Content-Type-Options"), "nosniff")
+            self.assertIn("frame-ancestors 'none'", r.headers.get("Content-Security-Policy", ""))
+            for host, status in ((f"localhost.:{PORT}", 200), (f"LOCALHOST:{PORT}", 200), ("localhost", 200),
+                                 (f"[::1]:{PORT}", 421), ("", 421)):
+                r = await s.get(f"{BASE}/healthz", headers={"Host": host})
+                self.assertEqual(r.status, status, host)
+
+    async def test_the_auth_guard_never_fails_open(self):
+        import bv_server
+
+        class Ws:
+            closed = False
+            code = None
+
+            async def close(self, code=None, message=None):
+                self.closed, self.code = True, code
+
+        def boom():
+            raise RuntimeError("token file unreadable")
+
+        class Req:
+            app = {"token_fn": boom, "cookie_name": "x"}
+            cookies = {}
+            headers = {}
+        ws = Ws()
+        await asyncio.wait_for(bv_server._auth_guard(Req(), ws), 5)
+        self.assertTrue(ws.closed and ws.code == 4401, "an error while checking the credential must end the stream")
+
+    async def test_reload_is_dropped_in_the_quiet_window_like_keys_and_clicks(self):
+        import bv_server
+        hub = bv_server.Hub("x", "http://127.0.0.1:1")
+        fired = []
+
+        async def fire(method, sid=None, **params):
+            fired.append(method)
+        hub.fire = fire
+
+        class C:
+            view = "single"
+
+            def __init__(self):
+                self._main_at = time.monotonic()
+
+            def main_tid(self):
+                return "T"
+        st = bv_server.Stream(hub, "T")
+        st.sid, st.level = "S", "med"
+        hub.streams["T"] = st
+        c = C()
+        try:
+            await hub.handle_input(c, {"t": "reload", "tab": "T"})
+            self.assertEqual(fired, [], "a reload meant for the previous page must not hit the new one")
+            c._main_at = time.monotonic() - 5
+            await hub.handle_input(c, {"t": "reload", "tab": "T"})
+            self.assertEqual(fired, ["Page.reload"])
+        finally:
+            await hub.http.close()
 
     async def test_security_headers_on_pages_and_errors(self):
         async with aiohttp.ClientSession() as s:
@@ -399,7 +480,7 @@ class ViewerTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("Secure", cookie, "over plain HTTP the cookie cannot carry Secure (the browser would drop it)")
             self.assertEqual((await s.get(f"{BASE}/api/auth")).status, 200)
             self.assertEqual((await s.get(f"{BASE}/api/stats")).status, 200)        # cookie only, no ?k=
-            ws = await s.ws_connect(f"{BASE}/ws?i=t1")
+            ws = await s.ws_connect(f"{BASE}/ws?i=t1", headers={"Origin": BASE})
             self.assertEqual((await ws.receive(timeout=5)).type, aiohttp.WSMsgType.TEXT)
             await ws.close()
         async with self._jar_session() as other:                                     # the same link a second time
@@ -846,6 +927,75 @@ class CoreTests(unittest.TestCase):
         for tk in tokens:
             self.assertTrue(bv_core.consume_bootstrap(tk))
 
+    def test_numeric_settings_from_the_environment_are_clamped_not_trusted(self):
+        import bv_server
+        for name in ("BV_TEST_X",):
+            try:
+                for raw, want in (("abc", 5.0), ("", 5.0), ("nan", 5.0), ("inf", 60.0), ("-inf", 0.2), ("-3", 0.2),
+                                  ("1e999", 60.0), ("0", 0.2), ("7.5", 7.5), ("1000", 60.0)):
+                    os.environ[name] = raw
+                    self.assertEqual(bv_server._env_float(name, 5.0, 0.2, 60.0), want, raw)
+            finally:
+                os.environ.pop(name, None)
+
+    def test_links_use_the_certificate_name_only_for_the_address_it_resolves_to(self):
+        real = bv_core.server_info
+        bv_core.server_info = lambda: {"port": 77, "hosts": ["127.0.0.1", "10.1.2.3", "10.9.9.9"],
+                                       "tls": {"hosts": ["10.1.2.3", "10.9.9.9"], "name": "box.example.ts.net", "name_host": "10.1.2.3"}}
+        try:
+            links = [u.split("/?b=")[0] for u in bv_core.links()]
+        finally:
+            bv_core.server_info = real
+        self.assertEqual(links, ["http://127.0.0.1:77", "https://box.example.ts.net:77", "https://10.9.9.9:77"])
+
+    def _listener(self, family, addr, port):
+        code = ("import socket,sys,time\ns=socket.socket(%s)\ns.bind((%r,%d))\ns.listen(1)\nprint('ready',flush=True)\ntime.sleep(60)"
+                % (family, addr, port))
+        proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True, start_new_session=True)
+        self.addCleanup(lambda: (proc.kill(), proc.wait(5), proc.stdout.close()))
+        self.assertEqual(proc.stdout.readline().strip(), "ready")
+        return proc
+
+    def test_a_listener_on_ipv6_loopback_never_vouches_for_the_ipv4_port(self):
+        p = free_port()
+        stranger = socket.socket()
+        stranger.bind(("127.0.0.1", p))
+        stranger.listen(1)
+        self.addCleanup(stranger.close)
+        try:
+            child = self._listener("socket.AF_INET6", "::1", p)
+        except AssertionError:
+            self.skipTest("no IPv6 loopback here")
+        self.assertFalse(bv_core._owns_port(p, child.pid), "a Chromium that fell back to [::1] must not vouch for a stranger on 127.0.0.1")
+
+    def test_the_process_we_started_owns_its_port_and_a_forking_wrapper_counts(self):
+        q = free_port()
+        child = self._listener("socket.AF_INET", "127.0.0.1", q)
+        self.assertTrue(bv_core._owns_port(q, child.pid))
+        self.assertFalse(bv_core._owns_port(q, os.getpid()), "this process does not hold that port")
+        r = free_port()
+        wrapper = subprocess.Popen(["sh", "-c", "%s -c \"import socket,time;s=socket.socket();s.bind(('127.0.0.1',%d));s.listen(1);print('up',flush=True);time.sleep(60)\" & wait" % (sys.executable, r)],
+                                   stdout=subprocess.PIPE, text=True, start_new_session=True)
+        self.addCleanup(lambda: (os.killpg(wrapper.pid, 9), wrapper.wait(5), wrapper.stdout.close()))
+        self.assertEqual(wrapper.stdout.readline().strip(), "up")
+        self.assertTrue(bv_core._owns_port(r, wrapper.pid), "a wrapper script that forks the browser is still ours")
+
+    def test_stop_server_never_signals_a_pid_whose_start_time_does_not_match(self):
+        decoy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "bv_server.py"], start_new_session=True)
+        self.addCleanup(lambda: (decoy.kill(), decoy.wait(5)))
+        real_start = bv_core._proc_start(decoy.pid)
+        d = Path(tempfile.mkdtemp(prefix="bv-stopsrv-"))
+        self.addCleanup(shutil.rmtree, d, True)
+        old = os.environ["BROWSER_VIEWER_HOME"]
+        os.environ["BROWSER_VIEWER_HOME"] = str(d)
+        self.addCleanup(os.environ.__setitem__, "BROWSER_VIEWER_HOME", old)
+        bv_core._write_private(bv_core.home() / "server.json", json.dumps({"pid": decoy.pid, "port": 1, "hosts": ["127.0.0.1"], "starttime": real_start + 99999}))
+        res = bv_core.stop_server()
+        self.assertFalse(res.get("stopped"))
+        self.assertIsNone(decoy.poll(), "a recycled pid must never be killed")
+        bv_core._write_private(bv_core.home() / "server.json", json.dumps({"pid": decoy.pid, "port": 1, "hosts": ["127.0.0.1"], "starttime": real_start}))
+        self.assertTrue(bv_core.stop_server().get("stopped"))
+
     def test_token_is_private_and_stable(self):
         t1 = bv_core.get_token()
         self.assertEqual(t1, bv_core.get_token())
@@ -865,7 +1015,7 @@ def _self_signed(directory: Path):
 
 @unittest.skipUnless(shutil.which("openssl"), "openssl is needed to make a throw-away certificate")
 class TlsTests(unittest.IsolatedAsyncioTestCase):
-    TLS_PORT = 9398
+    TLS_PORT = free_port()
 
     @classmethod
     def setUpClass(cls):
@@ -910,14 +1060,14 @@ class TlsTests(unittest.IsolatedAsyncioTestCase):
             for flag in ("Secure", "HttpOnly", "SameSite=Strict"):
                 self.assertIn(flag, cookie)
             self.assertEqual((await s.get(f"{base}/api/auth", ssl=self.ctx)).status, 200)
-            ws = await s.ws_connect(f"wss://127.0.0.1:{self.TLS_PORT}/ws", ssl=self.ctx)
+            ws = await s.ws_connect(f"wss://127.0.0.1:{self.TLS_PORT}/ws", ssl=self.ctx, headers={"Origin": base})
             self.assertEqual((await ws.receive(timeout=5)).type, aiohttp.WSMsgType.TEXT)
             await ws.close()
             with self.assertRaises(aiohttp.WSServerHandshakeError):   # an Origin that is not this server is refused
                 await s.ws_connect(f"wss://127.0.0.1:{self.TLS_PORT}/ws", ssl=self.ctx, headers={"Origin": "https://evil.example"})
 
     def test_server_refuses_inconsistent_tls_arguments(self):
-        base = [sys.executable, str(Path(bv_core.__file__).with_name("bv_server.py")), "--port", "9399", "--idle", "0"]
+        base = [sys.executable, str(Path(bv_core.__file__).with_name("bv_server.py")), "--port", str(free_port()), "--idle", "0"]
         for extra in (["--host", "127.0.0.1", "--tls-host", "127.0.0.1"],                       # no certificate
                       ["--host", "127.0.0.1", "--tls-host", "10.9.9.9", "--cert", "c", "--key", "k", "--tls-name", "x"]):  # not a --host
             r = subprocess.run(base + extra, capture_output=True, text=True, env=self.env, timeout=20)
@@ -1020,18 +1170,18 @@ elif a[0] == "cert":
         if not ip:
             self.skipTest("no non-loopback IPv4 address on this machine")
         bv_core.set_tls("files", cert=str(self.cert), key=str(self.key), name="box.test.ts.net")
-        info = bv_core.start_server(port=9396, hosts=["127.0.0.1", ip], idle_minutes=0)
+        info = bv_core.start_server(port=(P := free_port()), hosts=["127.0.0.1", ip], idle_minutes=0)
         self.addCleanup(bv_core.stop_server)
         self.assertEqual(info["tls"]["hosts"], [ip])
         self.assertEqual(info["tls"]["name"], "box.test.ts.net")
         self.assertIsNotNone(bv_core.server_info(), "the liveness probe must work with a TLS address")
-        self.assertEqual([u.split("/?b=")[0] for u in bv_core.links()], ["http://127.0.0.1:9396", "https://box.test.ts.net:9396"])
+        self.assertEqual([u.split("/?b=")[0] for u in bv_core.links()], [f"http://127.0.0.1:{P}", f"https://box.test.ts.net:{P}"])
         ctx = ssl._create_unverified_context()
-        with urllib.request.urlopen(f"https://{ip}:9396/healthz", timeout=5, context=ctx) as r:
+        with urllib.request.urlopen(f"https://{ip}:{P}/healthz", timeout=5, context=ctx) as r:
             self.assertEqual(r.status, 200)
         with self.assertRaises(Exception):
-            urllib.request.urlopen(f"http://{ip}:9396/healthz", timeout=5)       # plain HTTP is not served there
-        with urllib.request.urlopen("http://127.0.0.1:9396/healthz", timeout=5) as r:     # loopback stays plain
+            urllib.request.urlopen(f"http://{ip}:{P}/healthz", timeout=5)       # plain HTTP is not served there
+        with urllib.request.urlopen(f"http://127.0.0.1:{P}/healthz", timeout=5) as r:     # loopback stays plain
             self.assertEqual(r.status, 200)
 
     def test_tailscale_trouble_never_blocks_start_and_never_downgrades(self):
@@ -1045,11 +1195,11 @@ elif a[0] == "cert":
         broken = self.d / "bin" / "tailscale"
         broken.write_text("#!/bin/sh\necho nope >&2\nexit 1\n")
         # loopback only: TLS is not in play, tailscale must not even be asked
-        info = bv_core.start_server(port=9395, hosts=["127.0.0.1"], idle_minutes=0)
+        info = bv_core.start_server(port=free_port(), hosts=["127.0.0.1"], idle_minutes=0)
         self.assertNotIn("tls", info)
         bv_core.stop_server()
         # a TLS address while tailscale is down: the certificate on disk is reused, with a warning, still over HTTPS
-        info = bv_core.start_server(port=9395, hosts=["127.0.0.1", ip], idle_minutes=0)
+        info = bv_core.start_server(port=free_port(), hosts=["127.0.0.1", ip], idle_minutes=0)
         self.addCleanup(bv_core.stop_server)
         self.assertEqual(info["tls"]["hosts"], [ip])
         self.assertTrue(info.get("warnings") and "could not refresh" in info["warnings"][0], info)
@@ -1065,6 +1215,27 @@ elif a[0] == "cert":
         self.assertLess(time.time() - t0, 25, "must not wait out the 60 s timeout")
         self.assertIn("exited", str(cm.exception))
 
+    def test_an_expired_certificate_is_not_served_when_tailscale_cannot_renew_it(self):
+        ip = self._local_ipv4()
+        if not ip:
+            self.skipTest("no non-loopback IPv4 address on this machine")
+        self._fake_tailscale(["box.test.ts.net"])
+        bv_core.set_tls("tailscale")
+        (self.d / "bin" / "tailscale").write_text("#!/bin/sh\necho nope >&2\nexit 1\n")
+        real = bv_core._cert_days_left
+        bv_core._cert_days_left = lambda path: -1.0
+        self.addCleanup(setattr, bv_core, "_cert_days_left", real)
+        with self.assertRaises(bv_core.ViewerError):
+            bv_core.start_server(port=free_port(), hosts=["127.0.0.1", ip], idle_minutes=0)
+
+    def test_a_passphrase_protected_key_is_refused_and_never_prompts(self):
+        key, cert = self.d / "enc.key", self.d / "enc.pem"
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", str(key), "-out", str(cert), "-days", "2",
+                        "-passout", "pass:secret", "-subj", "/CN=box.test.ts.net"], check=True, capture_output=True)
+        with self.assertRaises(bv_core.ViewerError):
+            bv_core.set_tls("files", cert=str(cert), key=str(key), name="box.test.ts.net")
+        self.assertIsNone(bv_core.tls_settings())
+
     def test_tailscale_mode_refuses_when_the_tailnet_offers_no_certificate(self):
         self._fake_tailscale([])
         with self.assertRaises(bv_core.ViewerError) as cm:
@@ -1076,7 +1247,11 @@ elif a[0] == "cert":
 # --------------------------------------------------------------------------- the tool layer and the registry
 class _FakeCdp(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        body = json.dumps({"webSocketDebuggerUrl": "ws://127.0.0.1:1/devtools/browser/x", "Browser": "Fake/1"}).encode()
+        if self.path.startswith("/json/list"):
+            body = json.dumps([{"type": "page", "id": "T1", "title": "Reset your password " + "x" * 80,
+                                "url": "https://user:s3cretpw@accounts.example.com:8443/reset?code=ABC123#frag"}]).encode()
+        else:
+            body = json.dumps({"webSocketDebuggerUrl": "ws://127.0.0.1:1/devtools/browser/x", "Browser": "Fake/1"}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -1173,6 +1348,73 @@ class PluginActionTests(unittest.TestCase):
         core._save_instances({"gy": {"cdp": self.cdp, "port": 1, "managed": False, "pid": None, "profile": str(inside / "gone"), "created": 0}})
         core.stop_instance("gy", purge=True)
         self.assertFalse((inside / "gone").exists())
+
+    def test_local_probes_ignore_http_proxy_settings(self):
+        for var in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY"):
+            os.environ[var] = "http://127.0.0.1:9"                    # a proxy that is not there
+            self.addCleanup(os.environ.pop, var, None)
+        self.assertTrue(bv_core.cdp_alive(self.cdp), "a CDP probe on loopback must not be handed to a proxy")
+
+    def test_a_tab_never_shows_credentials_or_a_path_in_status(self):
+        core = self.plugin.bv_core
+        info = core.instance_info("fx", {"cdp": self.cdp, "port": int(self.cdp.rsplit(":", 1)[1]), "managed": False,
+                                         "pid": None, "profile": None, "created": 0})
+        blob = json.dumps(info)
+        for secret in ("s3cretpw", "user:", "ABC123", "/reset", "frag"):
+            self.assertNotIn(secret, blob)
+        self.assertEqual(info["tabs"][0]["origin"], "https://accounts.example.com:8443")
+        self.assertLessEqual(len(info["tabs"][0]["title"]), 60)
+        self.assertEqual(bv_core._origin("http://user:pw@[::1]:8080/x"), "http://[::1]:8080")
+
+    def test_the_browser_and_the_server_start_without_the_secrets_of_this_process(self):
+        os.environ["OPENAI_API_KEY"] = "sk-test-not-real"
+        self.addCleanup(os.environ.pop, "OPENAI_API_KEY", None)
+        core = self.plugin.bv_core
+        # the server: read what it really received
+        info = core.start_server(port=free_port(), hosts=["127.0.0.1"], idle_minutes=0)
+        self.addCleanup(core.stop_server)
+        environ = Path(f"/proc/{info['pid']}/environ").read_bytes().split(b"\0")
+        names = {e.split(b"=", 1)[0] for e in environ}
+        self.assertNotIn(b"OPENAI_API_KEY", names)
+        self.assertIn(b"BROWSER_VIEWER_HOME", names)
+        # the browser: a stand-in that writes down its environment
+        out = self.d / "chromium-env.txt"
+        fake = self.d / "fake-chromium"
+        fake.write_text(f'#!/bin/sh\nenv > {out}\nexec {sys.executable} -c "import time; time.sleep(300)" "$@"\n')
+        fake.chmod(0o755)
+        os.environ["BV_CHROMIUM"] = str(fake)
+        self.addCleanup(os.environ.pop, "BV_CHROMIUM", None)
+        old = core.START_TIMEOUT
+        core.START_TIMEOUT = 1.0
+        self.addCleanup(setattr, core, "START_TIMEOUT", old)
+        with self.assertRaises(core.ViewerError):
+            core.start_instance("envcheck")
+        deadline = time.time() + 5
+        while not out.exists() and time.time() < deadline:
+            time.sleep(0.1)
+        seen = out.read_text()
+        self.assertNotIn("OPENAI_API_KEY", seen)
+        self.assertIn("PATH=", seen)
+
+    def test_extra_host_names_can_be_allowed_and_are_validated(self):
+        core = self.plugin.bv_core
+        os.environ["BV_ALLOWED_HOSTS"] = "Viewer.Example.org, other.example.net"
+        self.addCleanup(os.environ.pop, "BV_ALLOWED_HOSTS", None)
+        port = free_port()
+        core.start_server(port=port, hosts=["127.0.0.1"], idle_minutes=0)
+        self.addCleanup(core.stop_server)
+        for host, want in (("viewer.example.org", 200), ("OTHER.example.net:%d" % port, 200), ("third.example.com", 421)):
+            req = urllib.request.Request(f"http://127.0.0.1:{port}/healthz", headers={"Host": host})
+            try:
+                with core._LOCAL.open(req, timeout=5) as r:
+                    status = r.status
+            except urllib.error.HTTPError as exc:
+                status = exc.code
+            self.assertEqual(status, want, host)
+        core.stop_server()
+        os.environ["BV_ALLOWED_HOSTS"] = "bad name!"
+        with self.assertRaises(core.ViewerError):
+            core.start_server(port=free_port(), hosts=["127.0.0.1"], idle_minutes=0)
 
     def test_the_child_environment_carries_no_secrets(self):
         os.environ["OPENAI_API_KEY"] = "sk-test-not-real"

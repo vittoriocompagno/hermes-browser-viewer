@@ -137,7 +137,7 @@ def run_action(args: Dict[str, Any]) -> Dict[str, Any]:
         if name in (None, "clear", "default"):
             msg = _set_cdp_url(None)
             bv_core.set_cdp_in_use(None)
-            return {"browser_exec": "browser pulito predefinito", "config": msg}
+            return {"browser_exec": "back to the default clean browser", "config": msg}
         inst = bv_core.load_instances().get(bv_core.check_name(name))
         if not inst:
             raise bv_core.ViewerError(f"unknown browser '{name}'")
