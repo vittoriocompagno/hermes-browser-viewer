@@ -36,11 +36,23 @@ hermes browser-viewer use --clear      # back to the default clean browser
 hermes browser-viewer stop login       # stop a browser (add --purge to also delete its profile)
 hermes browser-viewer stop --server    # stop the streaming server
 hermes browser-viewer token --rotate   # sign every browser out, then print a fresh login link
+hermes browser-viewer tls tailscale    # serve other devices over HTTPS with a Tailscale certificate (see below)
+hermes browser-viewer tls files --cert fullchain.pem --key key.pem --name viewer.example.com   # or your own certificate
+hermes browser-viewer tls off          # back to plain HTTP; `tls status` shows the current setting
 ```
 
 From a chat: the `browser_viewer` tool (actions `status`, `start`, `link`, `list`, `new`, `adopt`, `use`, `stop`, `rotate_token`) and the `/viewer` slash command. The agent starts a viewer, gives you the link, and after you have logged in switches `browser_exec` to that browser with `use`.
 
 Open the link from the device you want to control the browser from. It works once and for 10 minutes: use `link` again for another device. The server listens on the addresses you choose with `BROWSER_VIEWER_HOSTS`, by default loopback plus the machine's Tailscale IPv4 if `tailscale` is installed. It never binds `0.0.0.0`. It shuts itself down after 60 minutes with no open window.
+
+### HTTPS
+
+By default the server speaks plain HTTP, which is fine on loopback and on a Tailscale network (WireGuard encrypts it) and nowhere else. HTTPS is opt-in:
+
+- `tls tailscale` asks `tailscale cert` for a Let's Encrypt certificate for this machine's MagicDNS name. It needs MagicDNS and HTTPS Certificates enabled for the tailnet. The plugin refreshes the certificate every time the server starts.
+- `tls files` uses a certificate and key you already have, for the host name you pass with `--name`.
+
+The setting takes effect when the server next starts. Every address except loopback is then served over HTTPS (TLS 1.2 or newer) and links use the certificate's host name instead of the IP; loopback stays plain HTTP. The session cookie then carries the `Secure` flag.
 
 ## Configuration
 
@@ -60,6 +72,7 @@ State lives in the plugin data directory (`<hermes home>/plugin-data/browser-vie
 - Whoever holds the link controls a browser that may be logged in to your accounts. Treat the link like a password.
 - A link carries a one-time login token (192 random bits, valid 10 minutes). The page sends it with a same-origin `POST /api/session` and receives an `HttpOnly; SameSite=Strict` session cookie (named after the server port, 7 days by default). Merely opening or prefetching the URL does not use the token up, only that POST does; the token is then removed from the address bar. Only its SHA-256 is stored on the server, in a `0700` directory, and consuming it is an atomic file removal, so two simultaneous requests cannot both succeed.
 - The cookie is an HMAC-SHA256 signature over its expiry, keyed with a master secret kept in a `0600` file. The master secret never appears in a link, a page or a tool result. Rotating it (`rotate_token`, `token --rotate`) signs every browser out at once and drops login links that were not used yet, without restarting the server. Scripts can still present the master secret as `X-BV-Token`.
+- The cookie carries the `Secure` flag whenever it is served over HTTPS.
 - The WebSocket and the stats endpoint need the cookie (or the master secret). The static page is served without either and contains no secret.
 - The CDP port of every browser listens on `127.0.0.1` only. Adopted browsers must be loopback endpoints, and the plugin never kills a browser it did not start.
 - Cross-origin WebSocket connections are refused (`Origin` must match `Host`).
@@ -71,20 +84,21 @@ State lives in the plugin data directory (`<hermes home>/plugin-data/browser-vie
 
 What you should know before installing:
 
-- **Network.** Starts an HTTP/WebSocket server (aiohttp) that listens on the explicit IPv4 addresses above. The link is plain HTTP: on a Tailscale network WireGuard encrypts it, on any other network it is not encrypted. The plugin makes no outbound network calls. It talks to Chromium over `http://127.0.0.1`.
+- **Network.** Starts an HTTP/WebSocket server (aiohttp) that listens on the explicit IPv4 addresses above. It speaks plain HTTP unless you enable HTTPS: on a Tailscale network WireGuard encrypts plain HTTP, on any other network it is not encrypted. The plugin makes no outbound network calls of its own and talks to Chromium over `http://127.0.0.1`. The only exception is the opt-in `tls tailscale`, which runs `tailscale cert`: that contacts the Tailscale control plane and Let's Encrypt, and the machine's MagicDNS name appears in public Certificate Transparency logs. The certificate's private key is stored in a `0600` file in the plugin data directory.
 - **Credentials.** Managed browsers keep a persistent profile on disk, including cookies and logins, under the plugin data dir. The token file lives in the same directory.
-- **Shell commands.** Launches Chromium (`--remote-debugging-port` on loopback, `--user-data-dir=<profile>`), runs `chromium --version` to pick a binary at least as recent as the one that created a profile, runs `tailscale ip -4` to find the Tailscale address, and runs `hermes config set|unset browser.cdp_url` when you use `use` or `stop`.
+- **Shell commands.** Launches Chromium (`--remote-debugging-port` on loopback, `--user-data-dir=<profile>`), runs `chromium --version` to pick a binary at least as recent as the one that created a profile, runs `tailscale ip -4` to find the Tailscale address, `tailscale status --json` and `tailscale cert` when HTTPS is enabled with `tls tailscale`, and runs `hermes config set|unset browser.cdp_url` when you use `use` or `stop`.
 - **Global setting.** `use` writes `browser.cdp_url`, which makes every Hermes session of that profile (other chats, cron jobs) drive that browser until cleared. `stop` clears it if it points at the stopped browser.
 - **Background processes.** The streaming server is a detached process that outlives Hermes sessions and exits by itself after the idle timeout. Managed Chromium processes keep running until stopped.
 - **Reads outside its own data.** `/proc/<pid>` for process identity, and the Chromium builds Hermes installed under `<hermes home>/tools/`.
 - **Local CDP access.** Any CDP client on the same machine, Hermes included, can read what is in a page, password fields included. This plugin does not add that exposure, but it is why you should keep the host single-user.
 - **Links in the tool result.** `start` and `link` return login links. They work once and expire after 10 minutes, so a transcript does not hold anything reusable once a link has been used or has expired.
-- **Plain HTTP.** The server speaks HTTP, so the session cookie has no `Secure` flag and neither it nor the stream is encrypted on the wire. On a Tailscale network WireGuard encrypts everything; on any other network use a tunnel or do not expose the port.
+- **Plain HTTP unless you enable HTTPS.** Without `tls`, the session cookie has no `Secure` flag and neither it nor the stream is encrypted on the wire. On a Tailscale network WireGuard encrypts everything; on any other network enable `tls` or do not expose the port.
 - **Telemetry.** None.
 
 ## Known limitations
 
-- No TLS and no per-device session list: a session lasts until it expires or the master secret is rotated, and rotating signs every browser out.
+- HTTPS is opt-in, and the certificate is only refreshed when the server starts: a server kept running past the certificate's expiry keeps serving the old one (it exits after 60 idle minutes by default).
+- No per-device session list: a session lasts until it expires or the master secret is rotated, and rotating signs every browser out.
 - Frame rate and bandwidth were measured on loopback with simulated delay, not on real WAN links.
 - On a phone in portrait the remote page (1280 px wide) is scaled to about a third, so fields are small. Landscape is much more comfortable.
 - The tool handler is synchronous: a cold start can block for up to about 75 seconds (15 s for Chromium plus up to 60 s for the server).

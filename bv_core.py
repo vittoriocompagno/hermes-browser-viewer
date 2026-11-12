@@ -25,6 +25,7 @@ import secrets
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -458,7 +459,14 @@ def server_info() -> Optional[Dict[str, Any]]:
     if not _pid_alive(info.get("pid")):
         return None
     try:
-        http_json(f"http://127.0.0.1:{info['port']}/healthz", 1.5)
+        hosts, tls_hosts = info.get("hosts") or ["127.0.0.1"], set((info.get("tls") or {}).get("hosts", []))
+        h = "127.0.0.1" if "127.0.0.1" in hosts else hosts[0]
+        if h in tls_hosts:      # liveness probe of our own server: the certificate names a host, not this IP
+            url, ctx = f"https://{h}:{info['port']}/healthz", ssl._create_unverified_context()  # noqa: S323
+            with urllib.request.urlopen(url, timeout=1.5, context=ctx) as r:  # noqa: S310
+                json.loads(r.read().decode())
+        else:
+            http_json(f"http://{h}:{info['port']}/healthz", 1.5)
     except Exception:
         return None
     return info
@@ -470,6 +478,76 @@ def _python_cmd() -> List[str]:
     except ImportError:
         raise ViewerError("aiohttp is missing: install the plugin with its dependencies (hermes plugins install)") from None
     return [sys.executable]
+
+
+# --------------------------------------------------------------------------- HTTPS (opt-in)
+HOSTNAME_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$")
+
+
+def tls_settings() -> Optional[Dict[str, str]]:
+    """The HTTPS setting chosen with `hermes browser-viewer tls`, or None for plain HTTP."""
+    try:
+        rec = json.loads((home() / "tls.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return rec if isinstance(rec, dict) and rec.get("cert") and rec.get("key") and rec.get("name") else None
+
+
+def _tailscale_cert() -> Dict[str, str]:
+    """Get (or renew) a Let's Encrypt certificate for this machine's MagicDNS name through `tailscale cert`."""
+    exe = shutil.which("tailscale")
+    if not exe:
+        raise ViewerError("tailscale is not installed")
+    try:
+        st = json.loads(subprocess.run([exe, "status", "--json"], capture_output=True, text=True, timeout=10).stdout)  # noqa: S603
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        raise ViewerError(f"cannot read the Tailscale status: {type(exc).__name__}") from exc
+    name = ((st.get("Self") or {}).get("DNSName") or "").rstrip(".").lower()
+    if not name or name not in [d.lower() for d in (st.get("CertDomains") or [])]:
+        raise ViewerError("this tailnet does not offer HTTPS certificates for this machine "
+                          "(enable MagicDNS and HTTPS Certificates in the Tailscale admin console)")
+    if not HOSTNAME_RE.fullmatch(name):
+        raise ViewerError(f"unexpected machine name: {name!r}")
+    d = home() / "tls"
+    d.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(d, 0o700)
+    cert, key = d / "cert.pem", d / "key.pem"
+    try:
+        r = subprocess.run([exe, "cert", "--cert-file", str(cert), "--key-file", str(key), name],  # noqa: S603
+                           capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ViewerError(f"tailscale cert did not finish: {type(exc).__name__}") from exc
+    if r.returncode != 0:
+        raise ViewerError("tailscale cert failed: " + (r.stderr or r.stdout).strip()[:200])
+    with contextlib.suppress(OSError):
+        os.chmod(key, 0o600)
+    return {"mode": "tailscale", "name": name, "cert": str(cert), "key": str(key)}
+
+
+def set_tls(mode: str, cert: Optional[str] = None, key: Optional[str] = None, name: Optional[str] = None) -> Dict[str, Any]:
+    """Choose how the server is reached from other devices: tailscale (certificate from tailscale cert), files
+    (your own certificate and key for NAME) or off (plain HTTP). Takes effect when the server next starts."""
+    tls_file = home() / "tls.json"
+    if mode == "off":
+        tls_file.unlink(missing_ok=True)
+        return {"tls": "off"}
+    if mode == "tailscale":
+        rec = _tailscale_cert()
+    elif mode == "files":
+        name = (name or "").strip().lower()
+        if not (cert and key and HOSTNAME_RE.fullmatch(name)):
+            raise ViewerError("files mode needs a certificate, a key and the host name the certificate covers (--name)")
+        cert_p, key_p = Path(cert).expanduser().resolve(), Path(key).expanduser().resolve()
+        try:
+            ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(cert_p, key_p)
+        except (OSError, ssl.SSLError) as exc:
+            raise ViewerError(f"cannot load the certificate and key: {exc}") from exc
+        rec = {"mode": "files", "name": name, "cert": str(cert_p), "key": str(key_p)}
+    else:
+        raise ViewerError(f"unknown tls mode: {mode!r} (tailscale, files, off)")
+    _write_private(tls_file, json.dumps(rec))
+    return {"tls": mode, "name": rec["name"], "note": "applies the next time the server starts (hermes browser-viewer stop --server)"}
 
 
 def start_server(port: int = DEFAULT_SERVER_PORT, hosts: Optional[List[str]] = None, idle_minutes: int = 60) -> Dict[str, Any]:
@@ -488,6 +566,15 @@ def start_server(port: int = DEFAULT_SERVER_PORT, hosts: Optional[List[str]] = N
     cmd = _python_cmd() + [str(Path(__file__).with_name("bv_server.py")), "--port", str(int(port)), "--idle", str(int(idle_minutes))]
     for h in hosts:
         cmd += ["--host", h]
+    tls = tls_settings()
+    if tls:         # HTTPS on every address except loopback, which stays plain HTTP (a secure context for browsers anyway)
+        if tls["mode"] == "tailscale":
+            tls = _tailscale_cert()
+            _write_private(home() / "tls.json", json.dumps(tls))
+        for h in hosts:
+            if not ipaddress.ip_address(h).is_loopback:
+                cmd += ["--tls-host", h]
+        cmd += ["--cert", tls["cert"], "--key", tls["key"], "--tls-name", tls["name"]]
     env = dict(os.environ, BROWSER_VIEWER_HOME=str(home()))
     with open(home() / "server.log", "ab") as log:  # the child keeps its own copy of the descriptor
         subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True, env=env)  # noqa: S603
@@ -537,9 +624,15 @@ def links(instance: Optional[str] = None) -> List[str]:
     info = server_info()
     if not info:
         return []
-    # one single-use login token per link: opening it signs that browser in with a session cookie
-    return [f"http://{h}:{info['port']}/?b={new_bootstrap()}" + (f"&i={instance}" if instance else "")
-            for h in info.get("hosts", [])]
+    # one single-use login token per link: opening it signs that browser in with a session cookie.
+    # Addresses served with TLS are reached by the certificate's host name, the others by IP over plain HTTP.
+    tls = info.get("tls") or {}
+    out: List[str] = []
+    for h in info.get("hosts", []):
+        base = f"https://{tls['name']}:{info['port']}" if h in tls.get("hosts", []) else f"http://{h}:{info['port']}"
+        if base not in out:
+            out.append(base)
+    return [f"{b}/?b={new_bootstrap()}" + (f"&i={instance}" if instance else "") for b in out]
 
 
 def status() -> Dict[str, Any]:

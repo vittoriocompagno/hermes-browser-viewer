@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import shutil
+import ssl
 import struct
 import subprocess
 import sys
@@ -236,6 +237,7 @@ class ViewerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("HttpOnly", cookie)
             self.assertIn("SameSite=Strict", cookie)
             self.assertTrue(cookie.startswith(f"bvs_{PORT}="))
+            self.assertNotIn("Secure", cookie, "over plain HTTP the cookie cannot carry Secure (the browser would drop it)")
             self.assertEqual((await s.get(f"{BASE}/api/auth")).status, 200)
             self.assertEqual((await s.get(f"{BASE}/api/stats")).status, 200)        # cookie only, no ?k=
             ws = await s.ws_connect(f"{BASE}/ws?i=t1")
@@ -693,6 +695,148 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(t1, bv_core.get_token())
         self.assertEqual(oct((bv_core.home() / "token").stat().st_mode & 0o777), "0o600")
         self.assertEqual(oct(bv_core.home().stat().st_mode & 0o777), "0o700")
+
+
+# --------------------------------------------------------------------------- HTTPS
+def _self_signed(directory: Path):
+    cert, key = directory / "cert.pem", directory / "key.pem"
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", str(key), "-out", str(cert),
+                    "-days", "2", "-subj", "/CN=box.test.ts.net",
+                    "-addext", "subjectAltName=DNS:box.test.ts.net,IP:127.0.0.1"],
+                   check=True, capture_output=True)
+    return cert, key
+
+
+@unittest.skipUnless(shutil.which("openssl"), "openssl is needed to make a throw-away certificate")
+class TlsTests(unittest.IsolatedAsyncioTestCase):
+    TLS_PORT = 9398
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = Path(tempfile.mkdtemp(prefix="bv-tls-"))
+        cls.addClassCleanup(shutil.rmtree, cls.dir, True)
+        cls.cert, cls.key = _self_signed(cls.dir)
+        (cls.dir / "home").mkdir()
+        cls.env = dict(os.environ, BROWSER_VIEWER_HOME=str(cls.dir / "home"))
+        cls.proc = subprocess.Popen(
+            [sys.executable, str(Path(bv_core.__file__).with_name("bv_server.py")), "--host", "127.0.0.1",
+             "--tls-host", "127.0.0.1", "--cert", str(cls.cert), "--key", str(cls.key), "--tls-name", "box.test.ts.net",
+             "--port", str(cls.TLS_PORT), "--idle", "0"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=cls.env)
+        cls.addClassCleanup(lambda: (cls.proc.terminate(), cls.proc.wait(10)))
+        cls.ctx = ssl.create_default_context(cafile=str(cls.cert))
+
+    def _bootstrap(self):
+        old = os.environ["BROWSER_VIEWER_HOME"]
+        os.environ["BROWSER_VIEWER_HOME"] = self.env["BROWSER_VIEWER_HOME"]
+        try:
+            return bv_core.new_bootstrap()
+        finally:
+            os.environ["BROWSER_VIEWER_HOME"] = old
+
+    async def test_https_login_cookie_is_secure_and_wss_works(self):
+        base = f"https://127.0.0.1:{self.TLS_PORT}"
+        async with aiohttp.ClientSession(cookie_jar=aiohttp.CookieJar(unsafe=True)) as s:
+            self.assertTrue(await until(lambda: self.proc.poll() is None, 1))
+            for _ in range(100):                                   # the server needs a moment to start
+                try:
+                    if (await s.get(f"{base}/healthz", ssl=self.ctx)).status == 200:
+                        break
+                except aiohttp.ClientError:
+                    await asyncio.sleep(0.1)
+            else:
+                self.fail("the HTTPS server did not come up")
+            with self.assertRaises(aiohttp.ClientError):          # the same port does not answer plain HTTP
+                await s.get(f"http://127.0.0.1:{self.TLS_PORT}/healthz")
+            r = await s.post(f"{base}/api/session", json={"b": self._bootstrap()}, headers={"Origin": base}, ssl=self.ctx)
+            self.assertEqual(r.status, 200)
+            cookie = r.headers.getone("Set-Cookie")
+            for flag in ("Secure", "HttpOnly", "SameSite=Strict"):
+                self.assertIn(flag, cookie)
+            self.assertEqual((await s.get(f"{base}/api/auth", ssl=self.ctx)).status, 200)
+            ws = await s.ws_connect(f"wss://127.0.0.1:{self.TLS_PORT}/ws", ssl=self.ctx)
+            self.assertEqual((await ws.receive(timeout=5)).type, aiohttp.WSMsgType.TEXT)
+            await ws.close()
+            with self.assertRaises(aiohttp.WSServerHandshakeError):   # an Origin that is not this server is refused
+                await s.ws_connect(f"wss://127.0.0.1:{self.TLS_PORT}/ws", ssl=self.ctx, headers={"Origin": "https://evil.example"})
+
+    def test_server_refuses_inconsistent_tls_arguments(self):
+        base = [sys.executable, str(Path(bv_core.__file__).with_name("bv_server.py")), "--port", "9399", "--idle", "0"]
+        for extra in (["--host", "127.0.0.1", "--tls-host", "127.0.0.1"],                       # no certificate
+                      ["--host", "127.0.0.1", "--tls-host", "10.9.9.9", "--cert", "c", "--key", "k", "--tls-name", "x"]):  # not a --host
+            r = subprocess.run(base + extra, capture_output=True, text=True, env=self.env, timeout=20)
+            self.assertNotEqual(r.returncode, 0, extra)
+
+
+@unittest.skipUnless(shutil.which("openssl"), "openssl is needed to make a throw-away certificate")
+class TlsSettingsTests(unittest.TestCase):
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp(prefix="bv-tlsset-"))
+        self.addCleanup(shutil.rmtree, self.d, True)
+        self.old_home = os.environ["BROWSER_VIEWER_HOME"]
+        os.environ["BROWSER_VIEWER_HOME"] = str(self.d / "home")
+        self.addCleanup(os.environ.__setitem__, "BROWSER_VIEWER_HOME", self.old_home)
+        self.cert, self.key = _self_signed(self.d)
+
+    def test_links_use_the_certificate_name_only_for_tls_hosts(self):
+        real = bv_core.server_info
+        bv_core.server_info = lambda: {"port": 1234, "hosts": ["127.0.0.1", "10.1.2.3", "10.1.2.4"],
+                                       "tls": {"hosts": ["10.1.2.3", "10.1.2.4"], "name": "box.example.ts.net"}}
+        try:
+            links = bv_core.links("x")
+        finally:
+            bv_core.server_info = real
+        self.assertEqual([u.split("/?b=")[0] for u in links], ["http://127.0.0.1:1234", "https://box.example.ts.net:1234"])
+
+    def test_files_mode_validates_and_off_removes(self):
+        self.assertIsNone(bv_core.tls_settings())
+        for kwargs in ({}, {"name": "bad name!"}, {"name": "ok.example"}):
+            with self.assertRaises(bv_core.ViewerError):
+                bv_core.set_tls("files", cert=str(self.cert), key=str(self.d / "missing.pem") if kwargs.get("name") == "ok.example" else None, **kwargs)
+        res = bv_core.set_tls("files", cert=str(self.cert), key=str(self.key), name="Box.Test.ts.net")
+        self.assertEqual(res["name"], "box.test.ts.net")
+        self.assertEqual(bv_core.tls_settings()["name"], "box.test.ts.net")
+        self.assertEqual(oct((bv_core.home() / "tls.json").stat().st_mode & 0o777), "0o600")
+        with self.assertRaises(bv_core.ViewerError):
+            bv_core.set_tls("nonsense")
+        bv_core.set_tls("off")
+        self.assertIsNone(bv_core.tls_settings())
+
+    def _fake_tailscale(self, cert_domains):
+        bin_dir = self.d / "bin"
+        bin_dir.mkdir()
+        script = bin_dir / "tailscale"
+        script.write_text(f"""#!/usr/bin/env python3
+import json, shutil, sys
+a = sys.argv[1:]
+if a[:2] == ["status", "--json"]:
+    print(json.dumps({{"Self": {{"DNSName": "box.test.ts.net."}}, "CertDomains": {cert_domains!r}}}))
+elif a[0] == "cert":
+    cert, key = a[a.index("--cert-file") + 1], a[a.index("--key-file") + 1]
+    open(sys.argv[-1] + ".called", "w").write(" ".join(a))
+    shutil.copy({str(self.cert)!r}, cert); shutil.copy({str(self.key)!r}, key)
+""")
+        script.chmod(0o755)
+        old = os.environ["PATH"]
+        os.environ["PATH"] = f"{bin_dir}:{old}"
+        self.addCleanup(os.environ.__setitem__, "PATH", old)
+
+    def test_tailscale_mode_asks_tailscale_for_this_machines_certificate(self):
+        self._fake_tailscale(["box.test.ts.net"])
+        res = bv_core.set_tls("tailscale")
+        self.assertEqual(res["name"], "box.test.ts.net")
+        rec = bv_core.tls_settings()
+        self.assertEqual((rec["mode"], rec["name"]), ("tailscale", "box.test.ts.net"))
+        self.assertTrue(Path(rec["cert"]).is_file() and Path(rec["key"]).is_file())
+        self.assertEqual(oct(Path(rec["key"]).stat().st_mode & 0o777), "0o600")
+        self.assertEqual(oct((bv_core.home() / "tls").stat().st_mode & 0o777), "0o700")
+
+    def test_tailscale_mode_refuses_when_the_tailnet_offers_no_certificate(self):
+        self._fake_tailscale([])
+        with self.assertRaises(bv_core.ViewerError) as cm:
+            bv_core.set_tls("tailscale")
+        self.assertIn("HTTPS", str(cm.exception))
+        self.assertIsNone(bv_core.tls_settings())
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ import json
 import os
 import secrets
 import signal
+import ssl
 import struct
 import sys
 import time
@@ -667,7 +668,7 @@ async def session_login(request: web.Request) -> web.Response:
     master = request.app["token_fn"]()
     resp = web.json_response({"ok": True})
     resp.set_cookie(request.app["cookie_name"], make_session(master), max_age=SESSION_SECONDS,
-                    httponly=True, samesite="Strict", path="/")
+                    httponly=True, secure=request.secure, samesite="Strict", path="/")
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
@@ -786,7 +787,20 @@ async def main() -> None:
     ap.add_argument("--host", action="append", required=True)
     ap.add_argument("--port", type=int, default=bv_core.DEFAULT_SERVER_PORT)
     ap.add_argument("--idle", type=int, default=60, help="exit after N minutes with no window open (0 = never)")
+    ap.add_argument("--tls-host", action="append", default=[], help="serve this --host over HTTPS (needs --cert, --key)")
+    ap.add_argument("--cert")
+    ap.add_argument("--key")
+    ap.add_argument("--tls-name", help="host name the certificate covers; used in links")
     a = ap.parse_args()
+    if set(a.tls_host) - set(a.host):
+        sys.exit("--tls-host must also be given as --host")
+    ssl_ctx = None
+    if a.tls_host:
+        if not (a.cert and a.key and a.tls_name):
+            sys.exit("--tls-host needs --cert, --key and --tls-name")
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ssl_ctx.load_cert_chain(a.cert, a.key)
     for h in a.host:
         try:
             wildcard = ipaddress.ip_address(h).is_unspecified
@@ -818,11 +832,13 @@ async def main() -> None:
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     for h in a.host:
-        await web.TCPSite(runner, h, a.port).start()
+        await web.TCPSite(runner, h, a.port, ssl_context=ssl_ctx if h in a.tls_host else None).start()
     info = {"pid": os.getpid(), "port": a.port, "hosts": a.host, "idle_minutes": a.idle, "started": int(time.time())}
+    if a.tls_host:
+        info["tls"] = {"hosts": a.tls_host, "name": a.tls_name}
     sj = bv_core.home() / "server.json"
     bv_core._write_private(sj, json.dumps(info))
-    print(f"viewer: listening on {', '.join(f'{h}:{a.port}' for h in a.host)}", flush=True)
+    print(f"viewer: listening on {', '.join(f'{h}:{a.port}' + (' (https)' if h in a.tls_host else '') for h in a.host)}", flush=True)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()

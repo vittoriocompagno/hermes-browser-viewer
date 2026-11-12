@@ -81,9 +81,13 @@ def _links_payload(name: str | None) -> Dict[str, Any]:
     out: Dict[str, Any] = {"links": urls}
     if info:
         hosts = info.get("hosts", [])
+        tls_hosts = set((info.get("tls") or {}).get("hosts", []))
         if hosts == ["127.0.0.1"]:
             out["warning"] = ("the server listens on loopback only (no Tailscale IP found): "
                               "the link works only on this machine")
+        elif [h for h in hosts if h != "127.0.0.1" and h not in tls_hosts]:
+            out["warning"] = ("some links use plain HTTP, so the session cookie and the stream are not encrypted on the "
+                              "wire; on Tailscale run `hermes browser-viewer tls tailscale` and restart the server")
         out["note"] = (f"each link works once, for {bv_core.BOOTSTRAP_TTL // 60} minutes; opening it signs that browser in "
                        "(session cookie), ask for another link for another device, rotate_token signs everyone out; "
                        f"the server shuts down after {info.get('idle_minutes') or '∞'} minutes with no open window")
@@ -179,7 +183,15 @@ def _fmt(res: Dict[str, Any]) -> str:
 def _cli(args) -> None:
     cmd = getattr(args, "bv_cmd", None)
     if not cmd:
-        print("usage: hermes browser-viewer <start|link|status|list|new|adopt|use|stop|token> [...]")
+        print("usage: hermes browser-viewer <start|link|status|list|new|adopt|use|stop|token|tls> [...]")
+        return
+    if cmd == "tls":
+        try:
+            res = bv_core.set_tls(args.tls_mode, cert=args.cert, key=args.key, name=args.name) if args.tls_mode != "status" \
+                else {"tls": bv_core.tls_settings() or "off", "server": (bv_core.server_info() or {}).get("tls")}
+        except bv_core.ViewerError as exc:
+            raise SystemExit(f"error: {exc}")
+        print(_fmt(res))
         return
     mapping: Dict[str, Dict[str, Any]] = {
         "start": {"action": "start", "name": getattr(args, "name", None), "url": getattr(args, "url", None),
@@ -235,6 +247,11 @@ def _setup_cli(parser) -> None:
     p.add_argument("name", nargs="?")
     p.add_argument("--server", action="store_true")
     p.add_argument("--purge", action="store_true", help="also delete the profile (cookies and logins)")
+    p = sub.add_parser("tls", help="serve other devices over HTTPS: tailscale | files | off | status")
+    p.add_argument("tls_mode", choices=["tailscale", "files", "off", "status"])
+    p.add_argument("--cert", help="files mode: certificate (PEM, full chain)")
+    p.add_argument("--key", help="files mode: private key (PEM)")
+    p.add_argument("--name", help="files mode: host name the certificate covers")
     p = sub.add_parser("token", help="show a fresh login link; with --rotate sign every browser out first")
     p.add_argument("--rotate", action="store_true")
     parser.set_defaults(func=_cli)
