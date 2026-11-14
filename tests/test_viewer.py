@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -1014,6 +1015,20 @@ def _self_signed(directory: Path):
 
 
 @unittest.skipUnless(shutil.which("openssl"), "openssl is needed to make a throw-away certificate")
+@unittest.skipUnless(bv_core.LINUX, "on other platforms CoreTests already runs the psutil path")
+class CoreTestsPsutil(CoreTests):
+    """The same process checks through psutil, the path macOS takes, so Linux CI covers it too."""
+
+    def setUp(self):
+        try:
+            import psutil  # noqa: F401
+        except ImportError:
+            self.skipTest("psutil not installed")
+        patcher = mock.patch.object(bv_core, "LINUX", False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
 class TlsTests(unittest.IsolatedAsyncioTestCase):
     TLS_PORT = free_port()
 

@@ -1,7 +1,7 @@
 <p align="center">
   <img alt="Hermes 0.23.1 or newer" src="https://img.shields.io/badge/Hermes-%E2%89%A5%200.23.1-1a73e8?style=flat-square">
   <img alt="plugin version 0.1.0" src="https://img.shields.io/badge/plugin-0.1.0-0a84ff?style=flat-square">
-  <img alt="Linux" src="https://img.shields.io/badge/platform-Linux-34c759?style=flat-square">
+  <img alt="Linux | macOS" src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS-34c759?style=flat-square">
   <img alt="MIT license" src="https://img.shields.io/badge/license-MIT-8e8e93?style=flat-square">
 </p>
 
@@ -34,7 +34,7 @@ me a link. I open it on my phone or laptop, see your browser live and type the
 credentials myself. Then you carry on in the same logged-in browser.
 
 Setup, once:
-1. Check the requirements: Linux, Hermes 0.23.1 or newer (hermes --version) and a
+1. Check the requirements: Linux or macOS, Hermes 0.23.1 or newer (hermes --version) and a
    Chromium or Chrome binary (which chromium).
 2. Run: hermes plugins install vittoriocompagno/hermes-browser-viewer
 3. Run: hermes plugins enable browser-viewer
@@ -100,8 +100,8 @@ The agent asks for a link, you open it, you log in, and the agent keeps working 
 | Item | Details |
 |---|---|
 | Hermes | 0.23.1 or newer (developed and tested on v0.23.1) |
-| Plugin | 0.1.0, MIT |
-| System | Linux, tested on Arch-based Omarchy, x86_64 (process checks read `/proc`) |
+| Plugin | 0.2.0, MIT |
+| System | Linux, tested on Arch-based Omarchy, x86_64 (process checks read `/proc`). macOS on Apple Silicon, tested on GitHub's macOS runners (process checks through `psutil`, which Hermes already ships) |
 | Browser | Chromium or Chrome, tested with Chromium 155 |
 | Viewing device | any current browser, touch supported |
 | Network | loopback, or a Tailscale address; plain HTTP by default, HTTPS opt-in |
@@ -115,7 +115,7 @@ hermes plugins enable browser-viewer
 hermes browser-viewer start                                       # prints a login link: open it on your phone
 ```
 
-Requirements: Hermes `>=0.23.1`, the Python dependency `aiohttp>=3.9,<4` (installed with the plugin) and a Chromium or Chrome binary on the machine (`chromium`, `google-chrome-stable`, a path in `BV_CHROMIUM`, or one Hermes installed under its `tools/` directory).
+Requirements: Hermes `>=0.23.1`, the Python dependency `aiohttp>=3.9,<4` (installed with the plugin) and a Chromium or Chrome binary on the machine (`chromium`, `google-chrome-stable`, a path in `BV_CHROMIUM`, or one Hermes installed under its `tools/` directory). On macOS it also finds Google Chrome and Chromium in `/Applications` or `~/Applications`.
 
 ## Use
 
@@ -187,7 +187,7 @@ What you should know before installing:
 - **Shell commands.** Launches Chromium (`--remote-debugging-port` on loopback, `--user-data-dir=<profile>`), runs `chromium --version` to pick a binary at least as recent as the one that created a profile, runs `tailscale ip -4` to find the Tailscale address, `tailscale status --json` and `tailscale cert` when HTTPS is enabled with `tls tailscale`, and runs `hermes config set|unset browser.cdp_url` when you use `use` or `stop`.
 - **Global setting.** `use` writes `browser.cdp_url`, which makes every Hermes session of that profile (other chats, cron jobs) drive that browser until cleared, and `browser_exec` then acts with every login that browser holds. That is the point of `use`, and the tool description says it must only be called when the user asks. `stop` clears the setting first and stops the browser only if that worked. `hermes config` runs without an extra approval step, as a direct consequence of the action you asked for.
 - **Background processes.** The streaming server is a detached process that outlives Hermes sessions and exits by itself after the idle timeout. Managed Chromium processes keep running until stopped.
-- **Reads outside its own data.** `/proc/<pid>` and `/proc/net/tcp` (process identity, and to check that a new browser holds its debug port), and the Chromium builds Hermes installed under `<hermes home>/tools/`.
+- **Reads outside its own data.** `/proc/<pid>` and `/proc/net/tcp` on Linux, the same facts through `psutil` on macOS (process identity, and to check that a new browser holds its debug port), and the Chromium builds Hermes installed under `<hermes home>/tools/`.
 - **Local CDP access.** Any CDP client on the same machine, Hermes included, can read what is in a page, password fields included. This plugin does not add that exposure, but it is why you should keep the host single-user.
 - **Links in the tool result.** `start` and `link` return login links. They work once and expire after 10 minutes, so a transcript does not hold anything reusable once a link has been used or has expired.
 - **Plain HTTP unless you enable HTTPS.** Without `tls`, the session cookie has no `Secure` flag and neither it nor the stream is encrypted on the wire. On a Tailscale network WireGuard encrypts everything; on any other network enable `tls` or do not expose the port.

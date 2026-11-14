@@ -1,7 +1,8 @@
 """browser-viewer core: instance registry plus Chromium / viewer-server process management.
 
-Standard library only, no relative imports: it is imported by the plugin (``from . import bv_core``)
-and by the server process (``import bv_core``).
+Standard library only on Linux (process facts come from /proc). On macOS they come from psutil, which Hermes
+already ships. No relative imports: it is imported by the plugin (``from . import bv_core``) and by the server
+process (``import bv_core``).
 
 State lives in ``$BROWSER_VIEWER_HOME`` or ``<hermes home>/plugin-data/browser-viewer``:
     instances.json   registry of named browsers (managed = we launched it, external = attached)
@@ -39,6 +40,16 @@ DEFAULT_SERVER_PORT = 9281   # 9280 is left to the legacy login-viewer
 FIRST_CDP_PORT = 9222
 START_TIMEOUT = float(os.environ.get("BV_START_TIMEOUT", "15"))   # seconds to wait for a new Chromium
 LOOPBACK = ("127.0.0.1", "localhost", "[::1]", "::1")
+LINUX = sys.platform.startswith("linux")
+
+
+def _psutil():
+    """psutil for process facts where there is no /proc (macOS). Hermes depends on it, so it is normally there."""
+    try:
+        import psutil
+    except ImportError as exc:
+        raise ViewerError("psutil is required on this platform (pip install psutil)") from exc
+    return psutil
 
 
 class ViewerError(Exception):
@@ -185,6 +196,14 @@ def _pid_alive(pid: Optional[int]) -> bool:
         os.kill(int(pid), 0)
     except (OSError, ValueError):
         return False
+    if not LINUX:
+        ps = _psutil()
+        try:
+            return ps.Process(int(pid)).status() != ps.STATUS_ZOMBIE
+        except ps.NoSuchProcess:
+            return False
+        except ps.Error:
+            return True
     try:  # an exited child nobody has reaped yet is a zombie: not alive for our purposes
         with open(f"/proc/{int(pid)}/stat") as f:
             return f.read().rsplit(")", 1)[1].split()[0] != "Z"
@@ -193,7 +212,14 @@ def _pid_alive(pid: Optional[int]) -> bool:
 
 
 def _proc_start(pid: Optional[int]) -> Optional[int]:
-    """Start time of a process in clock ticks since boot (field 22 of /proc/<pid>/stat): identifies it across pid reuse."""
+    """Start time of a process, an integer that identifies it across pid reuse: clock ticks since boot (field 22 of
+    /proc/<pid>/stat) on Linux, hundredths of a second since the epoch elsewhere."""
+    if not LINUX:
+        ps = _psutil()
+        try:
+            return round(ps.Process(int(pid)).create_time() * 100)
+        except (ps.Error, ValueError, TypeError):
+            return None
     try:
         with open(f"/proc/{int(pid)}/stat") as f:
             return int(f.read().rsplit(")", 1)[1].split()[19])
@@ -202,6 +228,12 @@ def _proc_start(pid: Optional[int]) -> Optional[int]:
 
 
 def _proc_args(pid: Optional[int]) -> List[str]:
+    if not LINUX:
+        ps = _psutil()
+        try:
+            return [a for a in ps.Process(int(pid)).cmdline() if a]
+        except (ps.Error, ValueError, TypeError):
+            return []
     try:
         with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
             return [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
@@ -247,6 +279,12 @@ def _chromium_candidates() -> List[str]:
         w = shutil.which(name)
         if w and w not in out:
             out.append(w)
+    if sys.platform == "darwin":         # app bundles are not on PATH; same places Hermes looks
+        for root in ("/Applications", str(Path("~/Applications").expanduser())):
+            for app in ("Google Chrome.app/Contents/MacOS/Google Chrome", "Chromium.app/Contents/MacOS/Chromium"):
+                cand = f"{root}/{app}"
+                if os.access(cand, os.X_OK) and cand not in out:
+                    out.append(cand)
     for cand in sorted(glob.glob(str(hermes_home() / "tools" / "chromium-*" / "chrome-linux64" / "chrome")), reverse=True):
         if os.access(cand, os.X_OK) and cand not in out:
             out.append(cand)
@@ -305,6 +343,14 @@ def list_instances() -> List[Dict[str, Any]]:
 
 def _session_pids(sid: int) -> List[int]:
     """Processes of the session we started with start_new_session: a wrapper that forks still counts as ours."""
+    if not LINUX:
+        ps = _psutil()
+        found = []
+        for p in ps.pids():
+            with contextlib.suppress(OSError):
+                if os.getsid(p) == sid:
+                    found.append(p)
+        return found or [sid]
     out = []
     try:
         entries = [d.name for d in Path("/proc").iterdir() if d.name.isdigit()]
@@ -325,6 +371,18 @@ def _owns_port(port: int, pid: int) -> bool:
     """True if a process we started holds the listening socket on 127.0.0.1:`port`, not a stranger that got there
     first. Only the IPv4 loopback row counts: that is the address we connect to, and a Chromium that lost the
     IPv4 address to a stranger falls back to [::1], which must not vouch for the stranger's answer."""
+    if not LINUX:
+        ps = _psutil()
+        for p in _session_pids(pid):
+            try:
+                proc = ps.Process(p)
+                conns = proc.net_connections(kind="tcp4") if hasattr(proc, "net_connections") else proc.connections(kind="tcp4")
+            except ps.Error:
+                continue
+            if any(c.status == ps.CONN_LISTEN and c.laddr and c.laddr.ip == "127.0.0.1" and c.laddr.port == port
+                   for c in conns):
+                return True
+        return False
     inodes = set()
     try:
         rows = Path("/proc/net/tcp").read_text().splitlines()[1:]
@@ -511,8 +569,17 @@ def purge_bootstrap() -> None:
             f.unlink()
 
 
-def tailscale_ip() -> Optional[str]:
+def _tailscale_exe() -> Optional[str]:
+    """The tailscale CLI: on PATH, or inside the macOS app, which does not put it on PATH."""
     exe = shutil.which("tailscale")
+    mac = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+    if not exe and sys.platform == "darwin" and os.access(mac, os.X_OK):
+        exe = mac
+    return exe
+
+
+def tailscale_ip() -> Optional[str]:
+    exe = _tailscale_exe()
     if not exe:
         return None
     try:
@@ -575,7 +642,7 @@ def tls_settings() -> Optional[Dict[str, str]]:
 
 def _tailscale_cert() -> Dict[str, str]:
     """Get (or renew) a Let's Encrypt certificate for this machine's MagicDNS name through `tailscale cert`."""
-    exe = shutil.which("tailscale")
+    exe = _tailscale_exe()
     if not exe:
         raise ViewerError("tailscale is not installed")
     try:
