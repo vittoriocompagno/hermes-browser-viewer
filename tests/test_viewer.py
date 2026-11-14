@@ -35,6 +35,20 @@ os.environ["BROWSER_VIEWER_HOME"] = TMP
 os.environ["BV_CLOSE_GRACE"] = "1"
 os.environ["BV_AUTH_RECHECK"] = "0.5"      # open streams re-check their credential twice a second (5 s in real life)
 atexit.register(shutil.rmtree, TMP, True)
+
+
+def _keep_logs():
+    """CI: copy every Chromium and server log out of TMP before it is removed (BV_KEEP_LOGS names the target)."""
+    dest = os.environ.get("BV_KEEP_LOGS")
+    if not dest:
+        return
+    for i, log in enumerate(Path(TMP).rglob("*.log")):
+        target = Path(dest) / f"{i:03d}-{log.parent.name}-{log.name}"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(log, target)
+
+
+atexit.register(_keep_logs)                # atexit is last-in first-out: this runs before the rmtree above
 os.environ["TMPDIR"] = TMP                 # Chromium's own temp dirs land here too, and go with it
 import bv_core  # noqa: E402
 
@@ -185,8 +199,15 @@ def tok_header(token=None):
 
 
 def procs_with(arg):
-    """pids whose command line contains `arg` (a /proc scan: pgrep -f would also match its own shell)."""
+    """pids whose command line contains `arg` (a /proc scan, psutil where there is no /proc: pgrep -f would also
+    match its own shell)."""
     out = []
+    if not Path("/proc/self").exists():
+        import psutil
+        for proc in psutil.process_iter(["pid", "cmdline"]):
+            if proc.info["pid"] != os.getpid() and arg in " ".join(proc.info["cmdline"] or []):
+                out.append(proc.info["pid"])
+        return out
     for d in Path("/proc").iterdir():
         if d.name.isdigit() and int(d.name) != os.getpid():
             try:
@@ -1388,8 +1409,12 @@ class PluginActionTests(unittest.TestCase):
         # the server: read what it really received
         info = core.start_server(port=free_port(), hosts=["127.0.0.1"], idle_minutes=0)
         self.addCleanup(core.stop_server)
-        environ = Path(f"/proc/{info['pid']}/environ").read_bytes().split(b"\0")
-        names = {e.split(b"=", 1)[0] for e in environ}
+        if Path("/proc/self").exists():
+            environ = Path(f"/proc/{info['pid']}/environ").read_bytes().split(b"\0")
+            names = {e.split(b"=", 1)[0] for e in environ}
+        else:
+            import psutil
+            names = {k.encode() for k in psutil.Process(info["pid"]).environ()}
         self.assertNotIn(b"OPENAI_API_KEY", names)
         self.assertIn(b"BROWSER_VIEWER_HOME", names)
         # the browser: a stand-in that writes down its environment
