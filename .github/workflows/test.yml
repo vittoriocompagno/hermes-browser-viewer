@@ -27,11 +27,13 @@ jobs:
         run: python -m unittest -v tests.test_viewer
         env:
           BV_KEEP_LOGS: ${{ runner.temp }}/bv-logs
+          BV_START_TIMEOUT: "45"   # a cold Chromium on a shared runner once took longer than the 15 s default
       - name: tests on the regular Chromium
         run: python -m unittest tests.test_viewer
         env:
           BV_HEADLESS_SHELL: "0"
           BV_KEEP_LOGS: ${{ runner.temp }}/bv-logs
+          BV_START_TIMEOUT: "45"   # a cold Chromium on a shared runner once took longer than the 15 s default
       - name: Chromium logs
         if: failure()
         uses: actions/upload-artifact@v4
