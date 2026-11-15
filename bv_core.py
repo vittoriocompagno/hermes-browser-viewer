@@ -463,6 +463,7 @@ def _start_ua_attacher(cdp: str, exe: str, url: Optional[str]) -> Dict[str, Any]
     try:
         proc.stdin.write(json.dumps({
             "cdp": cdp, "ws": http_json(cdp + "/json/version")["webSocketDebuggerUrl"], "url": url,
+            "timeout": START_TIMEOUT,
             "userAgent": headless_user_agent(exe),
             "acceptLanguage": _weighted_accept_lang() if is_headless_shell(exe) else None}) + "\n")
         proc.stdin.close()

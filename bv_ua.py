@@ -30,7 +30,7 @@ import sys
 import time
 from urllib.parse import urlsplit
 
-INIT_TIMEOUT = 10.0     # seconds for every step of the set-up
+INIT_TIMEOUT = 10.0     # seconds for every step of the set-up, unless the parent passes a longer one
 MAX_LOG_LINES = 200     # ua.log must not grow with the number of requests
 # the order Chromium writes the client hints of a navigation in (the order of its own list of hints)
 HINT_ORDER = ("sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-full-version", "sec-ch-ua-arch", "sec-ch-ua-platform",
@@ -294,7 +294,8 @@ class Attacher:
 
 def main() -> int:
     config = json.loads(sys.stdin.readline())
-    ws = WebSocket(config["ws"], INIT_TIMEOUT)
+    timeout = max(INIT_TIMEOUT, float(config.get("timeout") or 0))
+    ws = WebSocket(config["ws"], timeout)
     attacher = Attacher(ws, config)
     try:
         attacher.initialize()       # a browser that does not answer within INIT_TIMEOUT ends it (socket timeout)
