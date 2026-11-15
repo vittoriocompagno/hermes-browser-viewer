@@ -413,8 +413,25 @@ def headless_user_agent(exe: str) -> Optional[str]:
     return f"Mozilla/5.0 ({plat}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
 
 
+def _screen_size(window: str) -> str:
+    """A desktop-sized screen that still contains the window (a window bigger than the screen gives a bot away)."""
+    w, h = (int(v) for v in window.split(","))
+    return f"{max(w, 1920)},{max(h, 1080)}"
+
+
+def _gpu_args() -> List[str]:
+    """Render with the real GPU when there is one (BV_GPU=0 turns it off): SwiftShader in WEBGL_debug_renderer_info
+    is the classic headless/server signature."""
+    if os.environ.get("BV_GPU", "1") == "0" or not glob.glob("/dev/dri/renderD*"):
+        return []
+    return ["--enable-gpu", "--use-angle=vulkan", "--enable-features=Vulkan", "--ignore-gpu-blocklist"]
+
+
 def _accept_lang() -> str:
-    """Languages for a browser that has none of its own (the headless shell), from the locale like Chromium does."""
+    """Languages for a browser that has none of its own (the headless shell), from the locale like Chromium does.
+    BV_ACCEPT_LANG overrides it."""
+    if os.environ.get("BV_ACCEPT_LANG"):
+        return os.environ["BV_ACCEPT_LANG"]
     loc = (os.environ.get("LC_ALL") or os.environ.get("LC_MESSAGES") or os.environ.get("LANG") or "").split(".")[0].split("@")[0]
     m = re.fullmatch(r"([a-z]{2,3})_([A-Z]{2})", loc)
     if not m or m.group(1) == "en":
@@ -597,11 +614,13 @@ def start_instance(name: str, url: str = "about:blank", port: Optional[int] = No
                 "--disable-background-timer-throttling", "--disable-renderer-backgrounding",
                 "--disable-backgrounding-occluded-windows"]
         if headless:
-            if is_headless_shell(exe):
-                # the shell is headless by construction. Unlike Chromium it says navigator.webdriver = true and sends
-                # no Accept-Language header at all, two things a site reads as "bot" before it looks at anything else
-                args += ["--disable-blink-features=AutomationControlled", f"--accept-lang={_accept_lang()}"]
-            else:
+            # the shell says navigator.webdriver = true and sends no Accept-Language; Chromium headless reports a
+            # screen of 800x600 (smaller than its own window) and renders WebGL with SwiftShader, the "server" GPU.
+            # Each of these is a bot signal anti-abuse systems read before anything else
+            args += ["--disable-blink-features=AutomationControlled", f"--accept-lang={_accept_lang()}",
+                     f"--ozone-override-screen-size={_screen_size(size)}"]
+            args += _gpu_args()
+            if not is_headless_shell(exe):
                 args.append("--headless=new")
             ua = headless_user_agent(exe)
             if ua:
