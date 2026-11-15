@@ -621,9 +621,16 @@ def server_info() -> Optional[Dict[str, Any]]:
 
 def _python_cmd() -> List[str]:
     try:
-        import aiohttp  # noqa: F401
+        import aiohttp
     except ImportError:
         raise ViewerError("aiohttp is missing: install the plugin with its dependencies (hermes plugins install)") from None
+    # Hermes may run on a bare interpreter with its venv only on sys.path: then sys.executable cannot import
+    # aiohttp, so start the server with the python of the venv that holds it (.../venv/lib/pythonX/site-packages)
+    venv = Path(aiohttp.__file__).resolve().parents[4]
+    for name in ("python", "python3"):
+        cand = venv / "bin" / name
+        if (venv / "pyvenv.cfg").is_file() and cand.is_file() and os.access(cand, os.X_OK):
+            return [str(cand)]
     return [sys.executable]
 
 
