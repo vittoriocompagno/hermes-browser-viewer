@@ -100,7 +100,7 @@ The agent asks for a link, you open it, you log in, and the agent keeps working 
 | Item | Details |
 |---|---|
 | Hermes | 0.23.1 or newer (developed and tested on v0.23.1) |
-| Plugin | 0.3.2, MIT |
+| Plugin | 0.3.3, MIT |
 | System | Linux, tested on Arch-based Omarchy, x86_64 (process checks read `/proc`). macOS on Apple Silicon, tested on GitHub's macOS runners (process checks through `psutil`, which Hermes already ships) |
 | Browser | Chromium or Chrome, tested with Chromium 155 |
 | Viewing device | any current browser, touch supported |
