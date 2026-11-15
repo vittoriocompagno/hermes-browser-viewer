@@ -52,6 +52,9 @@ SCHEMA = {
             "what": {"type": "string", "enum": ["browser", "server"], "description": "For stop: default 'browser'."},
             "purge": {"type": "boolean", "description": "For stop: also delete the browser profile (cookies, logins)."},
             "size": {"type": "string", "description": "Window size for a new browser, e.g. 1280,900."},
+            "engine": {"type": "string", "enum": ["auto", "shell", "chromium"],
+                       "description": "For start/new: auto (default: chrome-headless-shell when installed, lighter), "
+                                      "chromium (regular browser, if a site refuses the shell as a bot) or shell. Kept for later restarts."},
         },
         "required": ["action"],
     },
@@ -110,8 +113,11 @@ def run_action(args: Dict[str, Any]) -> Dict[str, Any]:
 
     if action in ("start", "new"):
         n = name or "login"
-        inst = bv_core.start_instance(n, url=args.get("url") or "about:blank", size=args.get("size") or "1280,900")
-        out: Dict[str, Any] = {"browser": {k: inst[k] for k in ("name", "cdp", "managed", "reused", "profile")}}
+        inst = bv_core.start_instance(n, url=args.get("url") or "about:blank", size=args.get("size") or "1280,900",
+                                      engine=args.get("engine") or None)
+        out: Dict[str, Any] = {"browser": {k: inst.get(k) for k in ("name", "cdp", "managed", "reused", "profile", "engine")}}
+        if inst.get("notes"):
+            out["notes"] = inst["notes"]
         if action == "start" or not bv_core.server_info():
             srv = bv_core.start_server()
             out["server"] = {"port": srv["port"], "hosts": srv["hosts"], "reused": srv.get("reused", False)}
@@ -202,12 +208,12 @@ def _cli(args) -> None:
         return
     mapping: Dict[str, Dict[str, Any]] = {
         "start": {"action": "start", "name": getattr(args, "name", None), "url": getattr(args, "url", None),
-                  "size": getattr(args, "size", None)},
+                  "size": getattr(args, "size", None), "engine": getattr(args, "engine", None)},
         "link": {"action": "link", "name": getattr(args, "name", None)},
         "status": {"action": "status"},
         "list": {"action": "list"},
         "new": {"action": "new", "name": getattr(args, "name", None), "url": getattr(args, "url", None),
-                "size": getattr(args, "size", None)},
+                "size": getattr(args, "size", None), "engine": getattr(args, "engine", None)},
         "adopt": {"action": "adopt", "name": getattr(args, "name", None), "cdp_url": getattr(args, "cdp", None)},
         "use": {"action": "use", "name": "clear" if getattr(args, "clear", False) else getattr(args, "name", None)},
         "stop": {"action": "stop", "name": getattr(args, "name", None), "what": "server" if getattr(args, "server", False) else "browser",
@@ -238,6 +244,7 @@ def _setup_cli(parser) -> None:
     p.add_argument("name", nargs="?", default="login")
     p.add_argument("--url")
     p.add_argument("--size")
+    p.add_argument("--engine", choices=["auto", "shell", "chromium"], help="browser engine (kept for later restarts)")
     p = sub.add_parser("link", help="print the viewer link")
     p.add_argument("name", nargs="?")
     sub.add_parser("status", help="status of the server and browsers")
@@ -246,6 +253,7 @@ def _setup_cli(parser) -> None:
     p.add_argument("name")
     p.add_argument("--url")
     p.add_argument("--size")
+    p.add_argument("--engine", choices=["auto", "shell", "chromium"], help="browser engine (kept for later restarts)")
     p = sub.add_parser("adopt", help="register a browser that is already running (loopback only)")
     p.add_argument("name")
     p.add_argument("cdp", help="http://127.0.0.1:<port>")

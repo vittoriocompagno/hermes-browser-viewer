@@ -100,7 +100,7 @@ The agent asks for a link, you open it, you log in, and the agent keeps working 
 | Item | Details |
 |---|---|
 | Hermes | 0.23.1 or newer (developed and tested on v0.23.1) |
-| Plugin | 0.2.0, MIT |
+| Plugin | 0.3.0, MIT |
 | System | Linux, tested on Arch-based Omarchy, x86_64 (process checks read `/proc`). macOS on Apple Silicon, tested on GitHub's macOS runners (process checks through `psutil`, which Hermes already ships) |
 | Browser | Chromium or Chrome, tested with Chromium 155 |
 | Viewing device | any current browser, touch supported |
@@ -140,6 +140,10 @@ From a chat: the `browser_viewer` tool (actions `status`, `start`, `link`, `list
 
 Open the link from the device you want to control the browser from. It works once and for 10 minutes: use `link` again for another device. The server listens on the addresses you choose with `BROWSER_VIEWER_HOSTS`, by default loopback plus the machine's Tailscale IPv4 if `tailscale` is installed. It never binds `0.0.0.0`. It shuts itself down after 60 minutes with no open window.
 
+### Engines
+
+Headless browsers run on [chrome-headless-shell](https://developer.chrome.com/blog/chrome-headless-shell) when it is installed: the same Blink as Chromium without the browser UI, measured at about a quarter of the memory (PSS 87 MB against 382 MB at rest, 229 MB against 484 MB with a Wikipedia page). Install it next to Hermes with `npx @puppeteer/browsers install chrome-headless-shell@<major of your Chromium> --path ~/.hermes/tools/chs`; picking the same major as the regular Chromium keeps the profile openable by both. The plugin sends the user agent of a windowed Chrome, hides `navigator.webdriver` and sets `Accept-Language`, but the shell's client hints (`Sec-CH-UA`) still name `HeadlessChrome`: if a site refuses it as a bot, restart that browser with `--engine chromium` (tool: `engine: "chromium"`); the choice is kept for later restarts of the same name.
+
 ### HTTPS
 
 By default the server speaks plain HTTP, which is fine on loopback and on a Tailscale network (WireGuard encrypts it) and nowhere else. HTTPS is opt-in:
@@ -155,6 +159,9 @@ The setting takes effect when the server next starts. Every address except loopb
 |---|---|---|
 | `BROWSER_VIEWER_HOSTS` | comma-separated specific IPv4 addresses to listen on | `127.0.0.1` plus the Tailscale IPv4 |
 | `BV_CHROMIUM` | path to the Chromium or Chrome binary | auto-detected |
+| `BV_HEADLESS_SHELL` | path to a `chrome-headless-shell` binary for headless browsers; `0` never uses one (headless browsers then run the regular Chromium) | auto-detected (`PATH`, Hermes' `tools/` directory) |
+| `BV_USER_AGENT` | user agent of headless browsers | the one of the same Chrome with a window |
+| `BV_MAX_FPS` | most frames a second a tab is streamed at (an animated page is otherwise sent at 60); `0` = no limit | `30` |
 | `BV_START_TIMEOUT` | seconds to wait for a new Chromium | `15` |
 | `BV_CLOSE_GRACE` | seconds an empty hub keeps its CDP connection | `20` |
 | `BV_SESSION_HOURS` | how long a signed-in browser stays signed in | `168` (7 days) |

@@ -668,6 +668,48 @@ class ViewerTests(unittest.IsolatedAsyncioTestCase):
                     await b.close_tab(t)
 
     # ---------------------------------------------------------------- speed / adaptivity
+    async def test_frames_are_not_deflated_and_an_animation_is_capped_at_the_frame_rate_limit(self):
+        import bv_server
+        async with Cdp(self.inst["cdp"]) as b:
+            tid = await b.new_tab(NOISE)
+            try:
+                async with aiohttp.ClientSession() as s, s.ws_connect(f"{BASE}/ws?i=t1", headers=tok_header(), compress=15,
+                                                                      max_msg_size=2 ** 24) as ws:
+                    self.assertFalse(ws.compress, "JPEG frames must not go through permessage-deflate")
+                async with Viewer("t1") as v:
+                    await v.view(tab=tid, q="low")
+                    self.assertTrue(await until(lambda: v.count() > 3, 10))
+                    t0, n0 = time.monotonic(), v.count()
+                    await asyncio.sleep(3.0)
+                    rate = (v.count() - n0) / (time.monotonic() - t0)
+                    self.assertLessEqual(rate, bv_server.MAX_FPS * 1.15, f"{rate:.1f} frames a second")
+                    self.assertGreater(rate, 8, f"{rate:.1f} frames a second")
+                    gaps = [y["t"] - x["t"] for x, y in zip(v.frames[n0:], v.frames[n0 + 1:])]
+                    self.assertLess(max(gaps), 0.5, "the limit must not stall the stream")
+            finally:
+                await b.close_tab(tid)
+
+    async def test_a_tab_that_did_not_change_is_not_sent_again_in_the_mosaic(self):
+        still = data_url("<body style='margin:0;background:#246'><h1>still</h1>")
+        async with Cdp(self.inst["cdp"]) as b:
+            tabs = [await b.new_tab(still + f"#{i}") for i in range(2)]
+            try:
+                async with Viewer("t1") as v:
+                    await v.view(mode="mosaic")
+                    self.assertTrue(await until(lambda: all(v.count(v.idx_of(t)) >= 1 for t in tabs), 10))
+                    await asyncio.sleep(1.0)
+                    n = {t: v.count(v.idx_of(t)) for t in tabs}
+                    await asyncio.sleep(3 * 2.0 + 0.5)                      # three snapshot rounds
+                    self.assertEqual({t: v.count(v.idx_of(t)) for t in tabs}, n, "unchanged snapshots must not be re-sent")
+                    async with Viewer("t1") as late:                        # a window that joins still gets the picture
+                        await late.view(mode="mosaic")
+                        self.assertTrue(await until(lambda: all(late.count(late.idx_of(t)) >= 1 for t in tabs), 6))
+                    await b.evaluate(tabs[0], "document.body.style.background='#a31'")
+                    self.assertTrue(await until(lambda: v.count(v.idx_of(tabs[0])) > n[tabs[0]], 8), "a change must come through")
+            finally:
+                for t in tabs:
+                    await b.close_tab(t)
+
     async def test_slow_client_does_not_slow_a_fast_one_and_is_bounded(self):
         async with Cdp(self.inst["cdp"]) as b:
             tid = await b.new_tab(NOISE)
@@ -817,12 +859,14 @@ class CoreTests(unittest.TestCase):
         return str(exe)
 
     def test_headless_prefers_the_shell_without_outgrowing_the_regular_browser(self):
+        # versions no installed browser reaches: on macOS the Chrome in /Applications is a candidate whatever PATH says,
+        # and with a real one newer than the fake shells the "not newer than the regular browser" rule picks another
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
-            regular = self._fake_browser(d, "bin/chromium", "155.0.8059.84")
-            old = self._fake_browser(d, "tools/chrome-headless-shell-150/chrome-headless-shell", "150.0.1.2")
-            same = self._fake_browser(d, "tools/chs/chrome-headless-shell/linux-155.0.8059.84/chrome-headless-shell-linux64/chrome-headless-shell", "155.0.8059.84")
-            newer = self._fake_browser(d, "tools/chrome-headless-shell-157/chrome-headless-shell", "157.0.1.2")
+            regular = self._fake_browser(d, "bin/chromium", "9155.0.8059.84")
+            old = self._fake_browser(d, "tools/chrome-headless-shell-150/chrome-headless-shell", "9150.0.1.2")
+            same = self._fake_browser(d, "tools/chs/chrome-headless-shell/linux-155.0.8059.84/chrome-headless-shell-linux64/chrome-headless-shell", "9155.0.8059.84")
+            newer = self._fake_browser(d, "tools/chrome-headless-shell-157/chrome-headless-shell", "9157.0.1.2")
             prof = d / "prof"
             prof.mkdir()
             env = {"PATH": str(d / "bin")}
@@ -833,7 +877,7 @@ class CoreTests(unittest.TestCase):
                 self.assertEqual(bv_core._headless_shell_candidates(), [newer, same, old])
                 self.assertEqual(bv_core.chromium_path(prof, headless=True), same)     # newest that is <= regular
                 self.assertEqual(bv_core.chromium_path(prof), regular)                 # a window: the regular browser
-                (prof / "Last Version").write_text("156.0.0.0")
+                (prof / "Last Version").write_text("9156.0.0.0")
                 self.assertEqual(bv_core.chromium_path(prof, headless=True), newer)    # never downgrade a profile
                 with mock.patch.dict(os.environ, {"BV_HEADLESS_SHELL": "0"}):
                     self.assertEqual(bv_core._headless_shell_candidates(), [])
@@ -841,6 +885,18 @@ class CoreTests(unittest.TestCase):
                     self.assertEqual(bv_core.chromium_path(prof / "x", headless=True), regular)   # explicit choice wins
                 self.assertTrue(bv_core.is_headless_shell(same))
                 self.assertFalse(bv_core.is_headless_shell(regular))
+                # engine: chromium always takes the regular browser, shell insists on a shell, junk is refused
+                self.assertEqual(bv_core.chromium_path(prof / "y", headless=True, engine="chromium"), regular)
+                self.assertEqual(bv_core.chromium_path(prof / "y", headless=False, engine="shell"), same)
+                with self.assertRaises(bv_core.ViewerError):
+                    bv_core.chromium_path(prof / "y", headless=True, engine="webkit")
+                with mock.patch.dict(os.environ, {"BV_HEADLESS_SHELL": "0"}):
+                    with self.assertRaises(bv_core.ViewerError):
+                        bv_core.chromium_path(prof / "y", headless=True, engine="shell")
+                with mock.patch.dict(os.environ, {"BV_HEADLESS_SHELL": str(d / "missing"), "BV_CHROMIUM": regular}):
+                    self.assertEqual(bv_core.chromium_path(prof / "y", headless=True), regular)  # a non-executable path is not explicit
+                broken = self._fake_browser(d, "tools/chrome-headless-shell-999/chrome-headless-shell", "garbage")
+                self.assertNotEqual(bv_core.chromium_path(prof / "y", headless=True), broken)    # unknown version is never picked
 
     def test_headless_user_agent_hides_headlesschrome(self):
         with tempfile.TemporaryDirectory() as d:
@@ -851,6 +907,144 @@ class CoreTests(unittest.TestCase):
             self.assertNotIn("Headless", ua)
             with mock.patch.dict(os.environ, {"BV_USER_AGENT": "Custom/1"}):
                 self.assertEqual(bv_core.headless_user_agent(exe), "Custom/1")
+
+    def test_the_server_python_is_the_one_of_the_venv_that_holds_aiohttp(self):
+        """Hermes can run on a bare interpreter with its venv only on sys.path: sys.executable cannot import aiohttp."""
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d).resolve()
+            for layout, exe in (("venv-posix/lib/python3.12/site-packages", "bin/python"),
+                                ("venv-win/Lib/site-packages", "Scripts/python.exe")):
+                venv = d / layout.split("/")[0]
+                pkg = venv / layout.split("/", 1)[1] / "aiohttp"
+                pkg.mkdir(parents=True)
+                (pkg / "__init__.py").write_text("")
+                with mock.patch.object(aiohttp, "__file__", str(pkg / "__init__.py")):
+                    self.assertEqual(bv_core._python_cmd(), [sys.executable], "not a venv: the running interpreter")
+                    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n")
+                    self.assertEqual(bv_core._python_cmd(), [sys.executable], "a venv without an interpreter is not used")
+                    py = venv / exe
+                    py.parent.mkdir()
+                    py.write_text("#!/bin/sh\n")
+                    py.chmod(0o755)
+                    self.assertEqual(bv_core._python_cmd(), [str(py)])
+            # a package that is a link into a cache (uv link-mode=symlink) still belongs to the venv it is linked from
+            cache = d / "cache" / "aiohttp"
+            cache.mkdir(parents=True)
+            (cache / "__init__.py").write_text("")
+            linked = d / "venv-link" / "lib" / "python3.12" / "site-packages"
+            linked.mkdir(parents=True)
+            (linked / "aiohttp").symlink_to(cache)
+            (d / "venv-link" / "pyvenv.cfg").write_text("home = /usr/bin\n")
+            py = d / "venv-link" / "bin" / "python3"
+            py.parent.mkdir()
+            py.write_text("#!/bin/sh\n")
+            py.chmod(0o755)
+            with mock.patch.object(aiohttp, "__file__", str(linked / "aiohttp" / "__init__.py")):
+                self.assertEqual(bv_core._python_cmd(), [str(py)])
+
+    def test_browser_versions_are_asked_once_and_again_when_the_binary_changes(self):
+        with tempfile.TemporaryDirectory() as d:
+            calls = Path(d) / "calls"
+            exe = Path(d) / "chromium"
+
+            def install(version):
+                exe.write_text(f"#!/bin/sh\necho x >> '{calls}'\necho 'Chromium {version}'\n")
+                exe.chmod(0o755)
+
+            def major():
+                with mock.patch.dict(bv_core._MAJORS, {}, clear=True):     # a new process each time
+                    return bv_core._major(str(exe))
+
+            install("9201.0.1.2")
+            self.assertEqual([major(), major(), major()], [9201] * 3)
+            self.assertEqual(len(calls.read_text().split()), 1, "the browser must be started once, not at every command")
+            install("9202.0.10.20")                                         # an update: another size, another mtime
+            self.assertEqual([major(), major()], [9202] * 2)
+            self.assertEqual(len(calls.read_text().split()), 2)
+            (bv_core.home() / "versions.json").write_text("{not json")     # a damaged cache is only a cache
+            self.assertEqual(major(), 9202)
+            exe.write_text("#!/bin/sh\nexit 1\n")
+            self.assertEqual(major(), 0)
+            install("9203.0.1.2")
+            self.assertEqual(major(), 9203, "a failure must not be remembered")
+
+    def test_a_cookie_set_just_before_stop_is_still_there_after_start(self):
+        """Chromium writes cookies to disk every 30 s: a login followed at once by `stop` was lost with the process."""
+        async def cdp(inst, method, **params):
+            async with Cdp(inst["cdp"]) as b:
+                return await b.call(method, **params)
+
+        a = bv_core.start_instance("fresh")
+        try:
+            asyncio.run(cdp(a, "Storage.setCookies", cookies=[{"name": "sid", "value": "just-logged-in", "domain": "example.test",
+                                                               "path": "/", "secure": True, "expires": time.time() + 86400}]))
+            t0 = time.monotonic()
+            self.assertTrue(bv_core.stop_instance("fresh")["stopped"])
+            self.assertLess(time.monotonic() - t0, 4.0)
+            self.assertFalse(bv_core._pid_alive(a["pid"]))
+            b = bv_core.start_instance("fresh")
+            got = {c["name"]: c["value"] for c in asyncio.run(cdp(b, "Storage.getCookies"))["cookies"]}
+            self.assertEqual(got.get("sid"), "just-logged-in")
+        finally:
+            _stop_instance("fresh")
+
+    def test_closing_over_cdp_gives_up_on_anything_that_is_not_a_browser(self):
+        srv = http.server.HTTPServer(("127.0.0.1", 0), _FakeCdp)           # answers /json/version, speaks no WebSocket
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            t0 = time.monotonic()
+            self.assertFalse(bv_core._cdp_close(f"http://127.0.0.1:{srv.server_address[1]}", os.getpid(), wait=0.2))
+            self.assertFalse(bv_core._cdp_close(f"http://127.0.0.1:{free_port()}", os.getpid(), wait=0.2))
+            self.assertLess(time.monotonic() - t0, 6.0)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_stopping_an_adopted_browser_does_not_forget_the_profile_of_ours(self):
+        custom = Path(TMP) / "custom-adopt"
+        a = bv_core.start_instance("mine", profile=str(custom))
+        other = bv_core.start_instance("mine-src")
+        try:
+            bv_core.stop_instance("mine")
+            bv_core.adopt_instance("mine", other["cdp"])                    # the same name, now somebody else's browser
+            bv_core.stop_instance("mine")
+            self.assertEqual(bv_core._remembered_profiles().get("mine"), str(custom))
+            self.assertEqual(bv_core.start_instance("mine")["profile"], a["profile"])
+        finally:
+            _stop_instance("mine")
+            _stop_instance("mine-src")
+            shutil.rmtree(custom, ignore_errors=True)
+
+    def test_the_headless_shell_is_started_without_its_bot_markers_and_stamps_the_profile(self):
+        shells = bv_core._headless_shell_candidates()
+        if not shells or os.environ.get("BV_CHROMIUM"):
+            self.skipTest("no chrome-headless-shell on this machine")
+
+        async def look(inst):
+            async with Cdp(inst["cdp"]) as b:
+                tid = next(t["targetId"] for t in (await b.call("Target.getTargets"))["targetInfos"] if t["type"] == "page")
+                return await b.evaluate(tid, "JSON.stringify([navigator.webdriver, navigator.languages, navigator.userAgent])")
+
+        a = bv_core.start_instance("shell")
+        try:
+            if a["engine"] != "headless-shell":
+                self.skipTest("the regular browser was chosen (shell newer than the profile allows)")
+            webdriver, langs, ua = json.loads(asyncio.run(look(a)))
+            self.assertFalse(webdriver, "navigator.webdriver must not say automation")
+            self.assertTrue(langs and len(langs) >= 2, f"the shell has no languages of its own: {langs}")
+            self.assertNotIn("Headless", ua)
+            self.assertGreater(bv_core._profile_major(Path(a["profile"])), 0, "the profile must say which version wrote it")
+        finally:
+            _stop_instance("shell")
+
+    def test_accept_language_follows_the_locale(self):
+        for env, want in (({"LANG": "it_IT.UTF-8"}, "it-IT,it,en-US,en"), ({"LANG": "en_GB.UTF-8"}, "en-US,en"),
+                          ({"LANG": "C"}, "en-US,en"), ({"LANG": "de_DE@euro", "LC_ALL": ""}, "de-DE,de,en-US,en"), ({}, "en-US,en")):
+            with mock.patch.dict(os.environ, env):
+                for k in ("LC_ALL", "LC_MESSAGES", "LANG"):
+                    if k not in env:
+                        os.environ.pop(k, None)
+                self.assertEqual(bv_core._accept_lang(), want, env)
 
     def test_stale_pid_is_never_signalled(self):
         """A registry entry whose pid now belongs to another process must not get that process killed."""

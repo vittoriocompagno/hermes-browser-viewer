@@ -14,6 +14,7 @@ State lives in ``$BROWSER_VIEWER_HOME`` or ``<hermes home>/plugin-data/browser-v
 """
 from __future__ import annotations
 
+import base64
 import contextlib
 import fcntl
 import glob
@@ -262,10 +263,44 @@ def _kill_group(pid: int) -> bool:
             send(pid, sig)
         t0 = time.time()
         while time.time() - t0 < wait and _pid_alive(pid):
-            time.sleep(0.1)
+            time.sleep(0.02)
         if not _pid_alive(pid):
             return True
     return False
+
+
+def _cdp_close(cdp: str, pid: int, wait: float = 3.0) -> bool:
+    """Ask the browser to close itself (CDP Browser.close) and wait for it; True when it is gone.
+    A signal to the process group also kills the network service, which keeps the cookies of the last 30 seconds
+    only in memory: a login done just before `stop` was lost. Closed this way, the browser writes them first.
+    Standard library only (the plugin process has no WebSocket client): one handshake, one masked text frame."""
+    try:
+        path = urlsplit(http_json(cdp + "/json/version")["webSocketDebuggerUrl"]).path
+        host, port = urlsplit(cdp).hostname, urlsplit(cdp).port
+        if not path.startswith("/devtools/browser/") or not host or not port:
+            return False
+        with socket.create_connection((host, port), timeout=2.0) as sk:
+            key = base64.b64encode(os.urandom(16)).decode()
+            sk.sendall((f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                        f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+            head = b""
+            while b"\r\n\r\n" not in head and len(head) < 8192:
+                chunk = sk.recv(1024)
+                if not chunk:
+                    return False
+                head += chunk
+            if b" 101 " not in head.split(b"\r\n", 1)[0]:
+                return False
+            payload, mask = b'{"id":1,"method":"Browser.close"}', os.urandom(4)
+            sk.sendall(bytes([0x81, 0x80 | len(payload)]) + mask + bytes(c ^ mask[i % 4] for i, c in enumerate(payload)))
+            with contextlib.suppress(OSError):
+                sk.recv(1024)               # the reply, or the connection closing
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+    t0 = time.time()
+    while time.time() - t0 < wait and _pid_alive(pid):
+        time.sleep(0.02)
+    return not _pid_alive(pid)
 
 
 # --------------------------------------------------------------------------- chromium
@@ -294,14 +329,41 @@ def _chromium_candidates() -> List[str]:
 _MAJORS: Dict[str, int] = {}
 
 
+def _exe_stamp(exe: str) -> Optional[List[int]]:
+    """Changes when the binary does (a package update replaces the file, and with it its inode and times)."""
+    try:
+        st = os.stat(exe)
+    except OSError:
+        return None
+    return [st.st_mtime_ns, st.st_size, st.st_ino]
+
+
 def _major(exe: str) -> int:
+    """Major version of a browser. Asking it (`--version`) starts the browser binary, 30 to 80 ms each and every
+    command of the plugin is a new process: the answers are kept in versions.json until the binary changes."""
     if exe not in _MAJORS:
+        stamp, cache_file = _exe_stamp(exe), home() / "versions.json"
+        try:
+            cache = json.loads(cache_file.read_text())
+            hit = cache.get(exe) if isinstance(cache, dict) else None
+        except (OSError, ValueError):
+            cache, hit = {}, None
+        if not isinstance(cache, dict):
+            cache = {}
+        if stamp and isinstance(hit, dict) and hit.get("stamp") == stamp and isinstance(hit.get("major"), int) and hit["major"] > 0:
+            _MAJORS[exe] = hit["major"]
+            return _MAJORS[exe]
         try:
             r = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=10)  # noqa: S603
             m = re.search(r"(\d+)\.\d+\.\d+\.\d+", r.stdout)
             _MAJORS[exe] = int(m.group(1)) if m else 0
         except (OSError, subprocess.SubprocessError):
             _MAJORS[exe] = 0
+        if stamp and _MAJORS[exe]:      # a failure is not remembered: it may be temporary
+            cache = {k: v for k, v in cache.items() if os.path.exists(k)}      # binaries that went away
+            cache[exe] = {"stamp": stamp, "major": _MAJORS[exe]}
+            with contextlib.suppress(OSError):
+                _write_private(cache_file, json.dumps(cache, indent=2, sort_keys=True))
     return _MAJORS[exe]
 
 
@@ -351,18 +413,38 @@ def headless_user_agent(exe: str) -> Optional[str]:
     return f"Mozilla/5.0 ({plat}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
 
 
-def chromium_path(profile: Optional[Path] = None, headless: bool = False) -> Optional[str]:
+def _accept_lang() -> str:
+    """Languages for a browser that has none of its own (the headless shell), from the locale like Chromium does."""
+    loc = (os.environ.get("LC_ALL") or os.environ.get("LC_MESSAGES") or os.environ.get("LANG") or "").split(".")[0].split("@")[0]
+    m = re.fullmatch(r"([a-z]{2,3})_([A-Z]{2})", loc)
+    if not m or m.group(1) == "en":
+        return "en-US,en"
+    return f"{m.group(1)}-{m.group(2)},{m.group(1)},en-US,en"
+
+
+ENGINES = ("auto", "shell", "chromium")
+
+
+def chromium_path(profile: Optional[Path] = None, headless: bool = False, engine: str = "auto") -> Optional[str]:
     """Pick a browser. A profile written by a newer Chrome must not be opened by an older one (it crashes).
-    Headless instances prefer chrome-headless-shell, choosing one no newer than the regular browser when possible,
-    so the profile still opens in the regular browser (e.g. to log in with a window)."""
+    Headless instances prefer chrome-headless-shell (engine 'auto'), choosing one no newer than the regular browser
+    when possible, so the profile still opens in the regular browser (e.g. to log in with a window).
+    engine 'chromium' always takes the regular browser: the shell still says HeadlessChrome in its client hints
+    (Sec-CH-UA), which a strict anti-bot site may refuse; engine 'shell' requires the shell."""
+    if engine not in ENGINES:
+        raise ViewerError(f"engine must be one of {', '.join(ENGINES)}")
     need = _profile_major(profile)
-    explicit = os.environ.get("BV_HEADLESS_SHELL", "") not in ("", "0")
-    if headless and (explicit or not os.environ.get("BV_CHROMIUM")):    # an explicit BV_CHROMIUM wins over found shells
+    env_shell = os.environ.get("BV_HEADLESS_SHELL", "")
+    explicit = env_shell not in ("", "0") and os.access(env_shell, os.X_OK)
+    want_shell = engine == "shell" or (engine == "auto" and headless and (explicit or not os.environ.get("BV_CHROMIUM")))
+    if want_shell:                                            # an explicit BV_CHROMIUM wins over found shells
         regular = max((_major(c) for c in _chromium_candidates()), default=0)
-        shells = [s for s in _headless_shell_candidates() if _major(s) >= need]
+        shells = [s for s in _headless_shell_candidates() if _major(s) and _major(s) >= need]
         pick = next((s for s in shells if not regular or _major(s) <= regular), shells[0] if shells else None)
         if pick:
             return pick
+        if engine == "shell":
+            raise ViewerError("no usable chrome-headless-shell found (install it in ~/.hermes/tools/chs or set BV_HEADLESS_SHELL)")
     cands = _chromium_candidates()
     if not cands or not need:
         return cands[0] if cands else None
@@ -471,8 +553,9 @@ def _remember_profile(name: str, profile: Optional[str]) -> None:
 
 
 def start_instance(name: str, url: str = "about:blank", port: Optional[int] = None, headless: bool = True,
-                   size: str = "1280,900", profile: Optional[str] = None) -> Dict[str, Any]:
-    """Launch (or reuse) a managed Chromium with a persistent profile and CDP on loopback."""
+                   size: str = "1280,900", profile: Optional[str] = None, engine: Optional[str] = None) -> Dict[str, Any]:
+    """Launch (or reuse) a managed Chromium with a persistent profile and CDP on loopback.
+    engine: auto (headless-shell when installed), shell or chromium; None keeps the choice made last time."""
     check_name(name)
     if not re.fullmatch(r"[0-9]{3,4},[0-9]{3,4}", size):
         raise ViewerError("size must be WIDTH,HEIGHT (e.g. 1280,900)")
@@ -490,8 +573,13 @@ def start_instance(name: str, url: str = "about:blank", port: Optional[int] = No
                 profile = cur["profile"]
             else:
                 profile = _remembered_profiles().get(name)
+        notes: List[str] = []
+        if profile and not Path(profile).expanduser().is_dir():
+            notes.append(f"the profile {profile} no longer exists: a new empty one is created (previous logins are not there)")
+        if engine is None:
+            engine = (cur or {}).get("engine_choice") or "auto"
         prof = Path(profile).expanduser() if profile else home() / "profiles" / name
-        exe = chromium_path(prof, headless=headless)
+        exe = chromium_path(prof, headless=headless, engine=engine)
         if not exe:
             raise ViewerError("no Chromium found (set BV_CHROMIUM or install chromium)")
         used = {int(i["port"]) for n, i in reg.items() if n != name}
@@ -509,7 +597,11 @@ def start_instance(name: str, url: str = "about:blank", port: Optional[int] = No
                 "--disable-background-timer-throttling", "--disable-renderer-backgrounding",
                 "--disable-backgrounding-occluded-windows"]
         if headless:
-            if not is_headless_shell(exe):      # the shell is headless by construction
+            if is_headless_shell(exe):
+                # the shell is headless by construction. Unlike Chromium it says navigator.webdriver = true and sends
+                # no Accept-Language header at all, two things a site reads as "bot" before it looks at anything else
+                args += ["--disable-blink-features=AutomationControlled", f"--accept-lang={_accept_lang()}"]
+            else:
                 args.append("--headless=new")
             ua = headless_user_agent(exe)
             if ua:
@@ -527,7 +619,7 @@ def start_instance(name: str, url: str = "about:blank", port: Optional[int] = No
                 break
             if cdp_alive(cdp) and _owns_port(port, proc.pid):    # the answer must come from OUR browser
                 break
-            time.sleep(0.15)
+            time.sleep(0.03)
         else:
             err = "Chromium is not responding on the debug port"
         if err:
@@ -535,11 +627,19 @@ def start_instance(name: str, url: str = "about:blank", port: Optional[int] = No
                 _kill_group(proc.pid)
             proc.poll()                      # reap
             raise ViewerError(err)
+        if is_headless_shell(exe) and _major(exe) > _profile_major(prof):
+            # the shell does not write "Last Version" like Chromium does: without it nothing stops an older regular
+            # browser from opening this profile later (chromium_path reads it), and that crashes
+            with contextlib.suppress(OSError):
+                (prof / "Last Version").write_text(f"{_major(exe)}.0.0.0")
         reg[name] = {"cdp": cdp, "port": port, "managed": True, "pid": proc.pid, "starttime": _proc_start(proc.pid),
                      "profile": str(prof), "created": int(time.time()),
-                     "engine": "headless-shell" if is_headless_shell(exe) else "chromium"}
+                     "engine": "headless-shell" if is_headless_shell(exe) else "chromium", "engine_choice": engine}
         _save_instances(reg)
-        return {**instance_info(name, reg[name]), "reused": False}
+        out = {**instance_info(name, reg[name]), "reused": False}
+        if notes:
+            out["notes"] = notes
+        return out
 
 
 def adopt_instance(name: str, cdp: str) -> Dict[str, Any]:
@@ -570,6 +670,7 @@ def stop_instance(name: str, purge: bool = False) -> Dict[str, Any]:
         pid = inst.get("pid")
         if inst.get("managed") and _pid_alive(pid):
             if _is_our_browser(inst):
+                _cdp_close(inst["cdp"], int(pid))       # lets it write its cookies; the signals below are the fallback
                 killed = _kill_group(int(pid))
                 if not killed:      # still running: keep the registry entry and the profile
                     raise ViewerError(f"cannot stop browser '{name}' (pid {pid}); retry or stop it by hand")
@@ -582,7 +683,8 @@ def stop_instance(name: str, purge: bool = False) -> Dict[str, Any]:
         if purge and prof and Path(prof).resolve().parent == (home() / "profiles").resolve():
             shutil.rmtree(prof, ignore_errors=True)
             purged = True
-        _remember_profile(name, None if purge else (prof if inst.get("managed") else None))
+        if inst.get("managed"):     # an adopted browser of the same name says nothing about the profile of ours
+            _remember_profile(name, None if purge else prof)
         out = {"name": name, "stopped": killed, "managed": bool(inst.get("managed")), "profile_deleted": purged}
         if stale:
             out["note"] = "the registered pid is no longer our browser (already closed): no process was touched"
@@ -702,11 +804,17 @@ def _python_cmd() -> List[str]:
         raise ViewerError("aiohttp is missing: install the plugin with its dependencies (hermes plugins install)") from None
     # Hermes may run on a bare interpreter with its venv only on sys.path: then sys.executable cannot import
     # aiohttp, so start the server with the python of the venv that holds it (.../venv/lib/pythonX/site-packages)
-    venv = Path(aiohttp.__file__).resolve().parents[4]
-    for name in ("python", "python3"):
-        cand = venv / "bin" / name
-        if (venv / "pyvenv.cfg").is_file() and cand.is_file() and os.access(cand, os.X_OK):
-            return [str(cand)]
+    # (Windows: .../venv/Lib/site-packages, python in Scripts). The path is tried as imported and resolved: resolving
+    # first would follow a package that is a link into a cache (uv link-mode=symlink) away from its venv.
+    pkg = Path(aiohttp.__file__)
+    for src in (pkg.absolute(), pkg.resolve()):
+        for venv in list(src.parents)[2:6]:
+            if not (venv / "pyvenv.cfg").is_file():
+                continue
+            for rel in ("bin/python", "bin/python3", "Scripts/python.exe"):
+                cand = venv / rel
+                if cand.is_file() and os.access(cand, os.X_OK):
+                    return [str(cand)]
     return [sys.executable]
 
 
@@ -849,13 +957,14 @@ def start_server(port: int = DEFAULT_SERVER_PORT, hosts: Optional[List[str]] = N
     with open(home() / "server.log", "ab") as log:  # the child keeps its own copy of the descriptor
         proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,  # noqa: S603
                                 env=_clean_env({"BROWSER_VIEWER_HOME": str(home())}))
-    for _ in range(300):  # up to 60 s
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
         info = server_info()
         if info:
             return {**info, "reused": False, **({"warnings": warnings} if warnings else {})}
         if proc.poll() is not None:                     # it died: say why now, not after a minute
             raise ViewerError(f"the server exited with code {proc.returncode}: {_last_log_line()}")
-        time.sleep(0.2)
+        time.sleep(0.03)
     raise ViewerError("the server did not start: see server.log in the plugin data directory")
 
 

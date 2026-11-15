@@ -19,10 +19,18 @@ jobs:
       - name: allow Chrome's sandbox
         if: runner.os == 'Linux'
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: chrome-headless-shell (the default engine of headless browsers)
+        run: npx -y @puppeteer/browsers install chrome-headless-shell@stable --path ~/.hermes/tools/chs
       - name: browser in use
-        run: python -c "import bv_core; print(bv_core._chromium_candidates())"
-      - run: python -m unittest -v tests.test_viewer
+        run: python -c "import bv_core; print(bv_core._chromium_candidates(), bv_core.chromium_path(headless=True))"
+      - name: tests on chrome-headless-shell
+        run: python -m unittest -v tests.test_viewer
         env:
+          BV_KEEP_LOGS: ${{ runner.temp }}/bv-logs
+      - name: tests on the regular Chromium
+        run: python -m unittest tests.test_viewer
+        env:
+          BV_HEADLESS_SHELL: "0"
           BV_KEEP_LOGS: ${{ runner.temp }}/bv-logs
       - name: Chromium logs
         if: failure()

@@ -56,6 +56,11 @@ def _env_float(name: str, default: float, lo: float, hi: float) -> float:
 
 CLOSE_GRACE = _env_float("BV_CLOSE_GRACE", 20.0, 0.0, 3600.0)   # seconds an empty hub keeps its CDP connection
 SNAP_INTERVAL = 2.0     # mosaic snapshot refresh
+# A page that animates is screencast at the display rate (60 frames a second, several megabytes a second at the
+# high level): nobody logging in needs that. At most MAX_FPS frames a second are passed on; a frame that comes
+# after a pause is never delayed, and the last frame of a burst is always delivered. BV_MAX_FPS=0 removes the limit.
+MAX_FPS = _env_float("BV_MAX_FPS", 30.0, 0.0, 240.0)
+FRAME_GAP = 1.0 / MAX_FPS if MAX_FPS else 0.0
 MOSAIC_MAX = 12
 MAX_CLIENTS_PER_HUB = 16
 ACTIVE_DWELL = 1.0      # follow mode does not switch tabs more often than this
@@ -84,6 +89,9 @@ class Stream:
         self.level: Optional[str] = None
         self.holds: list = []               # screencast acks we owe Chromium, in arrival order
         self.hold_timer: Optional[asyncio.TimerHandle] = None
+        self.pace_timer: Optional[asyncio.TimerHandle] = None
+        self.deferred: Optional[tuple] = None   # newest frame that came too soon after the previous one (w, h, base64)
+        self.sent_at = 0.0                  # monotonic time the last frame was passed on (frame pacing)
         self.frames = 0
         self.bytes = 0
         self.last: Optional[tuple] = None   # newest frame (w, h, jpeg): a window that joins later must not wait for the page to change
@@ -432,10 +440,9 @@ class Hub:
     async def _snap_loop(self) -> None:
         while True:
             await asyncio.sleep(SNAP_INTERVAL)
-            for st in list(self.streams.values()):
-                if st.mode == "poll" and st.sid:
-                    with contextlib.suppress(Exception):
-                        await self._snap(st)
+            polled = [st for st in list(self.streams.values()) if st.mode == "poll" and st.sid]
+            if polled:      # together: one after the other, a dozen tabs take several intervals to go round
+                await asyncio.gather(*(self._snap(st) for st in polled), return_exceptions=True)
 
     # -- streams
     def subscribers(self, tid: str):
@@ -495,6 +502,7 @@ class Hub:
             with contextlib.suppress(Exception):
                 await self.call("Page.stopScreencast", st.sid)
             self._clear_hold(st)
+            self._clear_pace(st)
         st.level = lvl
         if st.mode == "cast":
             await self._begin_cast(st)
@@ -506,6 +514,7 @@ class Hub:
         if not st:
             return
         self._clear_hold(st)
+        self._clear_pace(st)
         if st.sid:
             self.sid_map.pop(st.sid, None)
             if detach and not self.closed:
@@ -536,17 +545,39 @@ class Hub:
 
     def _on_cast_frame(self, st: Stream, p: Dict[str, Any]) -> None:
         md = p["metadata"]
-        ready = self._dispatch(st, int(md["deviceWidth"]), int(md["deviceHeight"]), base64.b64decode(p["data"]))
+        frame = (int(md["deviceWidth"]), int(md["deviceHeight"]), p["data"])
         st.holds.append(p["sessionId"])
+        wait = st.sent_at + FRAME_GAP - time.monotonic()
+        if wait > 0.002:                # too soon after the previous one: keep only the newest, pass it on in its slot
+            st.deferred = frame
+            if st.pace_timer is None:
+                st.pace_timer = asyncio.get_running_loop().call_later(wait, self._deliver_deferred, st)
+            return                      # its ack goes out with the frame that takes the slot
+        self._clear_pace(st)            # a frame still waiting for this slot is older than this one
+        self._deliver(st, frame)
+
+    def _deliver_deferred(self, st: Stream) -> None:
+        frame, st.pace_timer, st.deferred = st.deferred, None, None
+        if frame and self.streams.get(st.tid) is st:
+            self._deliver(st, frame)
+
+    def _deliver(self, st: Stream, frame: tuple) -> None:
+        st.sent_at = time.monotonic()
+        ready = self._dispatch(st, frame[0], frame[1], base64.b64decode(frame[2]))
         if ready:
             self._release_hold(st)      # releases this frame and any earlier one still owed
-        elif st.hold_timer is None:     # every watcher is busy: make the browser wait (briefly) instead of producing stale frames
+        elif st.holds and st.hold_timer is None:   # every watcher is busy: make the browser wait (briefly) instead of producing stale frames
             st.hold_timer = asyncio.get_running_loop().call_later(HOLD_TIMEOUT, self._release_hold, st)
 
     def _clear_hold(self, st: Stream) -> None:
         if st.hold_timer:
             st.hold_timer.cancel()
         st.holds, st.hold_timer = [], None
+
+    def _clear_pace(self, st: Stream) -> None:
+        if st.pace_timer:
+            st.pace_timer.cancel()
+        st.pace_timer, st.deferred = None, None
 
     def _release_hold(self, st: Stream) -> None:
         if st.holds and st.sid:
@@ -569,7 +600,10 @@ class Hub:
         q, mw, _mh = LEVELS["thumb"]
         r = await self.call("Page.captureScreenshot", st.sid, format="jpeg", quality=q,
                             clip={"x": 0, "y": 0, "width": cw, "height": ch, "scale": min(1.0, mw / max(cw, 1))})
-        self._dispatch(st, cw, ch, base64.b64decode(r["data"]))
+        jpg = base64.b64decode(r["data"])
+        if st.last and st.last == (cw, ch, jpg):
+            return          # the tab did not change: nothing to send (a window that joins gets st.last from replay)
+        self._dispatch(st, cw, ch, jpg)
 
     # -- input (only into a tab this client is actively viewing in single mode)
     async def handle_input(self, c: Client, m: Dict[str, Any]) -> None:
@@ -785,7 +819,9 @@ async def ws_handler(request: web.Request) -> web.StreamResponse:
     if not _origin_ok(request, required=(method == "cookie")):     # a browser always sends Origin; only the token header may omit it
         raise web.HTTPForbidden(text="origin")
     app = request.app
-    ws = web.WebSocketResponse(max_msg_size=256 * 1024, heartbeat=20)
+    # no permessage-deflate: the stream is JPEG, which does not shrink, and deflating every frame costs several
+    # times the CPU of everything else the server does (and adds its time to every frame)
+    ws = web.WebSocketResponse(max_msg_size=256 * 1024, heartbeat=20, compress=False)
     await ws.prepare(request)
     names = sorted(bv_core.load_instances())
     name = request.query.get("i") or (names[0] if names else "")
