@@ -100,7 +100,7 @@ The agent asks for a link, you open it, you log in, and the agent keeps working 
 | Item | Details |
 |---|---|
 | Hermes | 0.23.1 or newer (developed and tested on v0.23.1) |
-| Plugin | 0.3.1, MIT |
+| Plugin | 0.3.2, MIT |
 | System | Linux, tested on Arch-based Omarchy, x86_64 (process checks read `/proc`). macOS on Apple Silicon, tested on GitHub's macOS runners (process checks through `psutil`, which Hermes already ships) |
 | Browser | Chromium or Chrome, tested with Chromium 155 |
 | Viewing device | any current browser, touch supported |
@@ -161,6 +161,8 @@ The setting takes effect when the server next starts. Every address except loopb
 | `BV_CHROMIUM` | path to the Chromium or Chrome binary | auto-detected |
 | `BV_HEADLESS_SHELL` | path to a `chrome-headless-shell` binary for headless browsers; `0` never uses one (headless browsers then run the regular Chromium) | auto-detected (`PATH`, Hermes' `tools/` directory) |
 | `BV_USER_AGENT` | user agent of headless browsers | the one of the same Chrome with a window |
+| `BV_GPU` | `0` renders headless browsers with SwiftShader instead of the real GPU | `1` when `/dev/dri/renderD*` exists |
+| `BV_ACCEPT_LANG` | `Accept-Language` of headless browsers | from the system locale |
 | `BV_MAX_FPS` | most frames a second a tab is streamed at (an animated page is otherwise sent at 60); `0` = no limit | `30` |
 | `BV_START_TIMEOUT` | seconds to wait for a new Chromium | `15` |
 | `BV_CLOSE_GRACE` | seconds an empty hub keeps its CDP connection | `20` |
