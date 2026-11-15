@@ -33,7 +33,7 @@ SCHEMA = {
         "forwards the user's mouse, keyboard and paste. Several windows can watch the same or different tabs, and "
         "several named browsers can exist at once (each with its own persistent profile, e.g. one per account).\n"
         "Actions: start = make sure the viewer server and a browser exist and return the link (use first); "
-        "link = just the link; status / list = what is running; new = another named browser; adopt = register an "
+        "link = the link, starting the viewer server if it has stopped; status / list = what is running; new = another named browser; adopt = register an "
         "already running browser by its loopback CDP URL; use = point browser_exec at a browser (sets "
         "browser.cdp_url, which affects EVERY Hermes session (other chats, cron jobs) until cleared; only when the "
         "user asks; then open a NEW browser_exec session name); use with name 'clear' = back to the default clean "
@@ -129,9 +129,11 @@ def run_action(args: Dict[str, Any]) -> Dict[str, Any]:
         return out
 
     if action == "link":
-        if not bv_core.server_info():
-            raise bv_core.ViewerError("the server is not running: use action='start'")
-        return _links_payload(name)
+        srv = bv_core.start_server()
+        out = _links_payload(name)
+        if srv.get("warnings"):
+            out["warnings"] = srv["warnings"]
+        return out
 
     if action == "adopt":
         n = name or "login"
@@ -245,7 +247,7 @@ def _setup_cli(parser) -> None:
     p.add_argument("--url")
     p.add_argument("--size")
     p.add_argument("--engine", choices=["auto", "shell", "chromium"], help="browser engine (kept for later restarts)")
-    p = sub.add_parser("link", help="print the viewer link")
+    p = sub.add_parser("link", help="print the viewer link (starts the server if it has stopped)")
     p.add_argument("name", nargs="?")
     sub.add_parser("status", help="status of the server and browsers")
     sub.add_parser("list", help="registered browsers with their tabs")

@@ -24,6 +24,7 @@ import json
 import os
 import re
 import secrets
+import select
 import shutil
 import signal
 import socket
@@ -439,6 +440,44 @@ def _accept_lang() -> str:
     return f"{m.group(1)}-{m.group(2)},{m.group(1)},en-US,en"
 
 
+def _weighted_accept_lang() -> str:
+    """CDP expects the HTTP form, while --accept-lang accepts a language list."""
+    langs = [s.strip() for s in _accept_lang().split(",") if s.strip()]
+    return ",".join(s if ";q=" in s or i == 0 else f"{s};q={max(0.1, 1 - i * 0.1):.1f}"
+                    for i, s in enumerate(langs))
+
+
+def _ua_attacher_alive(inst: Dict[str, Any]) -> bool:
+    pid = inst.get("ua_pid")
+    return bool(_pid_alive(pid) and _proc_start(pid) == inst.get("ua_starttime")
+                and re.search(r"bv_ua\.py(?:\s|$)", " ".join(_proc_args(pid))))
+
+
+def _start_ua_attacher(cdp: str, exe: str, url: Optional[str]) -> Dict[str, Any]:
+    """Wait for the detached browser-lifetime attacher BEFORE allowing initial navigation."""
+    # standard library only: -I -S keep site-packages and the environment out of it (1 MB less, nothing to import)
+    cmd = _python_cmd() + ["-I", "-S", str(Path(__file__).with_name("bv_ua.py"))]
+    with open(home() / "ua.log", "ab") as log:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log,
+                                start_new_session=True, env=_clean_env(), text=True)
+    try:
+        proc.stdin.write(json.dumps({
+            "cdp": cdp, "ws": http_json(cdp + "/json/version")["webSocketDebuggerUrl"], "url": url,
+            "userAgent": headless_user_agent(exe),
+            "acceptLanguage": _weighted_accept_lang() if is_headless_shell(exe) else None}) + "\n")
+        proc.stdin.close()
+        readable, _, _ = select.select([proc.stdout], [], [], START_TIMEOUT)
+        if not readable or proc.stdout.readline().strip() != "ready":
+            raise ViewerError("client-hint attacher did not start: see ua.log")
+        return {"ua_pid": proc.pid, "ua_starttime": _proc_start(proc.pid)}
+    except Exception:
+        _kill_group(proc.pid)
+        proc.wait()
+        raise
+    finally:
+        proc.stdout.close()
+
+
 ENGINES = ("auto", "shell", "chromium")
 
 
@@ -582,6 +621,10 @@ def start_instance(name: str, url: str = "about:blank", port: Optional[int] = No
         reg = load_instances()
         cur = reg.get(name)
         if cur and cdp_alive(cur["cdp"]):
+            if (cur.get("managed") and cur.get("ua_override") and os.environ.get("BV_UA_OVERRIDE", "1") != "0"
+                    and _is_our_browser(cur) and not _ua_attacher_alive(cur)):
+                cur.update(_start_ua_attacher(cur["cdp"], cur["executable"], None))
+                _save_instances(reg)
             return {**instance_info(name, cur), "reused": True}
         # a name keeps its profile across restarts and stops: falling back to the default would open an empty one
         # (logins "gone"); the registry entry may be dead (crash, reboot) or removed by stop_instance
@@ -625,7 +668,8 @@ def start_instance(name: str, url: str = "about:blank", port: Optional[int] = No
             ua = headless_user_agent(exe)
             if ua:
                 args.append(f"--user-agent={ua}")
-        args.append(url)
+        ua_override = headless and os.environ.get("BV_UA_OVERRIDE", "1") != "0"
+        args.append("about:blank" if ua_override else url)
         with open(home() / f"chromium-{name}.log", "ab") as log:
             proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,  # noqa: S603
                                     env=_clean_env())
@@ -646,13 +690,22 @@ def start_instance(name: str, url: str = "about:blank", port: Optional[int] = No
                 _kill_group(proc.pid)
             proc.poll()                      # reap
             raise ViewerError(err)
+        ua_state = {}
+        if ua_override:
+            try:
+                ua_state = _start_ua_attacher(cdp, exe, url)
+            except Exception:
+                _kill_group(proc.pid)
+                proc.wait()
+                raise
         if is_headless_shell(exe) and _major(exe) > _profile_major(prof):
             # the shell does not write "Last Version" like Chromium does: without it nothing stops an older regular
             # browser from opening this profile later (chromium_path reads it), and that crashes
             with contextlib.suppress(OSError):
                 (prof / "Last Version").write_text(f"{_major(exe)}.0.0.0")
         reg[name] = {"cdp": cdp, "port": port, "managed": True, "pid": proc.pid, "starttime": _proc_start(proc.pid),
-                     "profile": str(prof), "created": int(time.time()),
+                     "profile": str(prof), "created": int(time.time()), **ua_state,
+                     "ua_override": ua_override, "executable": exe, "headless": headless,
                      "engine": "headless-shell" if is_headless_shell(exe) else "chromium", "engine_choice": engine}
         _save_instances(reg)
         out = {**instance_info(name, reg[name]), "reused": False}
@@ -695,6 +748,8 @@ def stop_instance(name: str, purge: bool = False) -> Dict[str, Any]:
                     raise ViewerError(f"cannot stop browser '{name}' (pid {pid}); retry or stop it by hand")
             else:
                 stale = True        # the pid now belongs to something else: never signal it
+        if inst.get("managed") and (killed or not _pid_alive(pid)) and _ua_attacher_alive(inst):
+            _kill_group(int(inst["ua_pid"]))
         del reg[name]
         _save_instances(reg)
         purged = False

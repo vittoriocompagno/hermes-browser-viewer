@@ -230,6 +230,110 @@ def _stop_instance(name):
         pass
 
 
+class FingerprintTests(unittest.IsolatedAsyncioTestCase):
+    async def test_attacher_lifetime_reuse_and_recovery_preserve_tabs(self):
+        inst = await asyncio.to_thread(bv_core.start_instance, "hints-reuse", port=free_port())
+        self.addCleanup(_stop_instance, "hints-reuse")
+        original = bv_core.load_instances()["hints-reuse"]
+        self.assertTrue(bv_core._ua_attacher_alive(original))
+        async with Cdp(inst["cdp"]) as b:
+            tid = bv_core.cdp_tabs(inst["cdp"])[0]["id"]
+            url = inst["cdp"] + "/json/version"
+            await b.navigate(tid, url)
+            self.assertTrue(await until(lambda: any(t["url"] == url for t in bv_core.cdp_tabs(inst["cdp"]))))
+            reused = await asyncio.to_thread(bv_core.start_instance, "hints-reuse")
+            self.assertTrue(reused["reused"])
+            self.assertEqual(bv_core.load_instances()["hints-reuse"]["ua_pid"], original["ua_pid"])
+            bv_core._kill_group(original["ua_pid"])
+            await asyncio.to_thread(bv_core.start_instance, "hints-reuse")
+            repaired = bv_core.load_instances()["hints-reuse"]
+            self.assertNotEqual(repaired["ua_pid"], original["ua_pid"])
+            self.assertTrue(bv_core._ua_attacher_alive(repaired))
+            self.assertEqual([(t["id"], t["url"]) for t in bv_core.cdp_tabs(inst["cdp"])], [(tid, url)])
+            value = await b.evaluate(tid, "navigator.userAgentData.brands")
+            self.assertNotIn("HeadlessChrome", json.dumps(value))
+        await asyncio.to_thread(bv_core.stop_instance, "hints-reuse", purge=True)
+        self.assertFalse(bv_core._pid_alive(repaired["ua_pid"]))
+
+    async def test_opt_out_and_adopted_browsers_never_start_attacher(self):
+        with mock.patch.dict(os.environ, {"BV_UA_OVERRIDE": "0"}), \
+             mock.patch.object(bv_core, "_start_ua_attacher", side_effect=AssertionError("opted out")):
+            inst = await asyncio.to_thread(bv_core.start_instance, "hints-off", port=free_port())
+        self.addCleanup(_stop_instance, "hints-off")
+        self.assertNotIn("ua_pid", bv_core.load_instances()["hints-off"])
+        bv_core.adopt_instance("hints-adopted", inst["cdp"])
+        self.addCleanup(_stop_instance, "hints-adopted")
+        with mock.patch.object(bv_core, "_start_ua_attacher", side_effect=AssertionError("adopted")):
+            reused = await asyncio.to_thread(bv_core.start_instance, "hints-adopted")
+        self.assertTrue(reused["reused"])
+        self.assertFalse(reused["managed"])
+        self.assertNotIn("ua_pid", bv_core.load_instances()["hints-adopted"])
+
+    async def test_metadata_and_first_request_for_initial_new_popup_and_worker(self):
+        class Echo(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                headers = {k.lower(): v for k, v in self.headers.items()}
+                headers["path"] = self.path
+                self.server.seen.append(headers)
+                body = json.dumps(headers).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Accept-CH", "Sec-CH-UA-Full-Version-List")
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except BrokenPipeError:
+                    pass
+            def log_message(self, *args):
+                pass
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Echo)
+        srv.seen = []
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        url = f"http://127.0.0.1:{srv.server_port}/"
+        inst = await asyncio.to_thread(bv_core.start_instance, "hints", url=url, port=free_port())
+        self.addCleanup(_stop_instance, "hints")
+        self.assertTrue(await until(lambda: srv.seen))
+        expr = "navigator.userAgentData.getHighEntropyValues(['fullVersionList','architecture','bitness','platformVersion'])"
+        async with Cdp(inst["cdp"]) as b:
+            tid = bv_core.cdp_tabs(inst["cdp"])[0]["id"]
+            sid = (await b.call("Target.attachToTarget", targetId=tid, flatten=True))["sessionId"]
+            async def metadata(session):
+                r = await b.call("Runtime.evaluate", session, expression=expr, awaitPromise=True, returnByValue=True)
+                value = r["result"]["value"]
+                self.assertTrue(value["fullVersionList"], value)
+                self.assertNotIn("HeadlessChrome", json.dumps(value))
+                version = (await b.call("Browser.getVersion"))["product"].split("/")[-1]
+                chromium = next(x for x in value["fullVersionList"] if x["brand"] == "Chromium")
+                self.assertEqual(chromium["version"], version)
+                self.assertEqual(value["bitness"], "64")
+            await metadata(sid)
+            new = await b.new_tab(url + "new")
+            self.assertTrue(await until(lambda: any(h["path"] == "/new" for h in srv.seen)))
+            await b.navigate(new, url + "second")
+            self.assertTrue(await until(lambda: any(h["path"] == "/second" for h in srv.seen)))
+            nsid = (await b.call("Target.attachToTarget", targetId=new, flatten=True))["sessionId"]
+            await metadata(nsid)
+            await b.call("Runtime.evaluate", sid, expression=f"window.open({json.dumps(url + 'popup')})", userGesture=True)
+            self.assertTrue(await until(lambda: len(bv_core.cdp_tabs(inst["cdp"])) >= 3))
+            popup = next(t["id"] for t in bv_core.cdp_tabs(inst["cdp"]) if t["id"] not in (tid, new))
+            psid = (await b.call("Target.attachToTarget", targetId=popup, flatten=True))["sessionId"]
+            await metadata(psid)
+            worker = "new Promise(resolve=>{const w=new Worker(URL.createObjectURL(new Blob([`navigator.userAgentData.getHighEntropyValues(['fullVersionList']).then(x=>postMessage(x))`],{type:'text/javascript'})));w.onmessage=e=>{w.terminate();resolve(e.data)}})"
+            r = await b.call("Runtime.evaluate", sid, expression=worker, awaitPromise=True, returnByValue=True)
+            self.assertTrue(r["result"]["value"]["fullVersionList"], r)
+            self.assertNotIn("HeadlessChrome", json.dumps(r))
+        self.assertTrue(await until(lambda: {"/", "/new", "/second", "/popup"} <= {h["path"] for h in srv.seen}))
+        for headers in srv.seen:
+            self.assertEqual(headers.get("accept-language"), bv_core._weighted_accept_lang())
+            self.assertNotIn("HeadlessChrome", headers.get("sec-ch-ua", ""), headers)
+            self.assertIn("Chromium", headers.get("sec-ch-ua", ""), headers)
+        full = [h["sec-ch-ua-full-version-list"] for h in srv.seen if "sec-ch-ua-full-version-list" in h]
+        self.assertTrue(full, srv.seen)
+        self.assertTrue(all('Chromium' in h and 'HeadlessChrome' not in h for h in full), full)
+
+
 class ViewerTests(unittest.IsolatedAsyncioTestCase):
     @classmethod
     def setUpClass(cls):
@@ -897,6 +1001,12 @@ class CoreTests(unittest.TestCase):
                     self.assertEqual(bv_core.chromium_path(prof / "y", headless=True), regular)  # a non-executable path is not explicit
                 broken = self._fake_browser(d, "tools/chrome-headless-shell-999/chrome-headless-shell", "garbage")
                 self.assertNotEqual(bv_core.chromium_path(prof / "y", headless=True), broken)    # unknown version is never picked
+
+    def test_weighted_accept_language(self):
+        with mock.patch.dict(os.environ, {"BV_ACCEPT_LANG": "it-IT,it,en-US,en"}):
+            self.assertEqual(bv_core._weighted_accept_lang(), "it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7")
+        with mock.patch.dict(os.environ, {"BV_ACCEPT_LANG": "fr-FR,fr;q=0.6,en;q=0.2"}):
+            self.assertEqual(bv_core._weighted_accept_lang(), "fr-FR,fr;q=0.6,en;q=0.2")
 
     def test_headless_user_agent_hides_headlesschrome(self):
         with tempfile.TemporaryDirectory() as d:
@@ -1585,6 +1695,26 @@ class PluginActionTests(unittest.TestCase):
         sys.modules["bvplugin"] = self.plugin
         self.addCleanup(sys.modules.pop, "bvplugin", None)
         spec.loader.exec_module(self.plugin)
+
+    def test_link_starts_server_without_starting_browser_tool_and_cli(self):
+        import argparse
+        import io
+        import contextlib
+        core = self.plugin.bv_core
+        real_start = core.start_server
+        port = free_port()
+        self.addCleanup(core.stop_server)
+        with mock.patch.object(core, "start_server", side_effect=lambda: real_start(port=port, hosts=["127.0.0.1"])), \
+             mock.patch.object(core, "start_instance", side_effect=AssertionError("link must not launch a browser")):
+            out = json.loads(self.plugin.tool_handler({"action": "link", "name": "login"}))
+            self.assertTrue(out.get("links"), out)
+            self.assertEqual(core.server_info()["port"], port)
+            core.stop_server()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                self.plugin._cli(argparse.Namespace(bv_cmd="link", name="login"))
+            self.assertIn(f"http://127.0.0.1:{port}/?b=", buf.getvalue())
+            self.assertEqual(core.server_info()["port"], port)
 
     def calls(self):
         return self.log.read_text().splitlines() if self.log.exists() else []

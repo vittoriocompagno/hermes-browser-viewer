@@ -123,7 +123,7 @@ From a terminal:
 
 ```bash
 hermes browser-viewer start            # starts the server and the browser "login", prints the link
-hermes browser-viewer link             # print the link again
+hermes browser-viewer link             # print the link again (starts the server if it has stopped)
 hermes browser-viewer new work         # a second browser with its own profile
 hermes browser-viewer adopt main http://127.0.0.1:9222   # register a Chromium that is already running (loopback only)
 hermes browser-viewer use login        # make browser_exec drive this browser
@@ -142,7 +142,7 @@ Open the link from the device you want to control the browser from. It works onc
 
 ### Engines
 
-Headless browsers run on [chrome-headless-shell](https://developer.chrome.com/blog/chrome-headless-shell) when it is installed: the same Blink as Chromium without the browser UI, measured at about a quarter of the memory (PSS 87 MB against 382 MB at rest, 229 MB against 484 MB with a Wikipedia page). Install it next to Hermes with `npx @puppeteer/browsers install chrome-headless-shell@<major of your Chromium> --path ~/.hermes/tools/chs`; picking the same major as the regular Chromium keeps the profile openable by both. The plugin sends the user agent of a windowed Chrome, hides `navigator.webdriver` and sets `Accept-Language`, but the shell's client hints (`Sec-CH-UA`) still name `HeadlessChrome`: if a site refuses it as a bot, restart that browser with `--engine chromium` (tool: `engine: "chromium"`); the choice is kept for later restarts of the same name.
+Headless browsers run on [chrome-headless-shell](https://developer.chrome.com/blog/chrome-headless-shell) when it is installed: the same Blink as Chromium without the browser UI, measured at about a quarter of the memory (PSS 87 MB against 382 MB at rest, 229 MB against 484 MB with a Wikipedia page). Install it next to Hermes with `npx @puppeteer/browsers install chrome-headless-shell@<major of your Chromium> --path ~/.hermes/tools/chs`; picking the same major as the regular Chromium keeps the profile openable by both. The plugin sends the user agent of a windowed Chrome, hides `navigator.webdriver` and sets `Accept-Language`. A small process next to each headless browser (about 7 MB, standard library only) rewrites the client hints before the first request, so `Sec-CH-UA` and `navigator.userAgentData` match that windowed Chrome: no `HeadlessChrome`, and the full version list is filled in. `BV_UA_OVERRIDE=0` turns the rewrite off. If a site still refuses the shell, restart that browser with `--engine chromium` (tool: `engine: "chromium"`); the choice is kept for later restarts of the same name.
 
 ### HTTPS
 
@@ -163,6 +163,7 @@ The setting takes effect when the server next starts. Every address except loopb
 | `BV_USER_AGENT` | user agent of headless browsers | the one of the same Chrome with a window |
 | `BV_GPU` | `0` renders headless browsers with SwiftShader instead of the real GPU | `1` when `/dev/dri/renderD*` exists |
 | `BV_ACCEPT_LANG` | `Accept-Language` of headless browsers | from the system locale |
+| `BV_UA_OVERRIDE` | `0` leaves the browser's own client hints (the shell then names `HeadlessChrome` in `Sec-CH-UA`) | `1` |
 | `BV_MAX_FPS` | most frames a second a tab is streamed at (an animated page is otherwise sent at 60); `0` = no limit | `30` |
 | `BV_START_TIMEOUT` | seconds to wait for a new Chromium | `15` |
 | `BV_CLOSE_GRACE` | seconds an empty hub keeps its CDP connection | `20` |
