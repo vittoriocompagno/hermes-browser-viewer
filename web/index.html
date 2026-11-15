@@ -1,44 +1,213 @@
 <!doctype html>
 <meta charset="utf-8">
 <title>Browser viewer</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
 <style>
-:root{color-scheme:dark}
-html,body{margin:0;height:100%;background:#111;color:#ddd;font:13px system-ui;overflow:hidden}
-body{display:flex;flex-direction:column}
-#bar{display:flex;gap:8px;align-items:center;padding:6px 10px;background:#1b1b1b;border-bottom:1px solid #333}
-#st{width:10px;height:10px;border-radius:50%;background:#c33;flex:none}#st.on{background:#3c3}
-#tabs{display:flex;gap:4px;flex:1;min-width:0;overflow-x:auto;scrollbar-width:none}
-.chip{flex:none;max-width:190px;padding:3px 9px;background:#262626;border:1px solid #3a3a3a;border-radius:6px;cursor:pointer;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;color:#bbb}
-.chip.cur{background:#2d3f55;border-color:#4a6a92;color:#fff}.chip.act:before{content:"● ";color:#6c6}
-select,button{background:#2a2a2a;color:#ddd;border:1px solid #444;border-radius:6px;padding:3px 8px;cursor:pointer;font:inherit}
-label{display:flex;gap:4px;align-items:center;white-space:nowrap}
-#info{display:flex;gap:12px;padding:4px 10px;background:#161616;border-bottom:1px solid #2a2a2a}
-#url{flex:1;min-width:0;color:#9cd;font-family:ui-monospace,monospace;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
-#stage{display:flex;justify-content:center;align-items:center;padding:8px;flex:1;min-height:0;overflow:hidden;box-sizing:border-box}
-#main{max-width:100%;max-height:100%;width:auto;height:auto;background:#fff;outline:none;box-shadow:0 0 0 1px #333;object-fit:contain;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
-#grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:10px;width:100%;overflow:auto;align-content:start}
-.cell{background:#1b1b1b;border:1px solid #333;border-radius:8px;overflow:hidden;cursor:pointer}
-.cell:hover{border-color:#6a9ad0}.cell canvas{width:100%;display:block;background:#fff;aspect-ratio:4/3;object-fit:contain}
-.cell .cap{padding:4px 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:#aaa}
-#kbd.on{background:#2d3f55;border-color:#4a6a92;color:#fff}
-#kb{position:fixed;left:0;bottom:0;width:1px;height:1px;opacity:0;border:0;padding:0;margin:0;resize:none;font-size:16px;pointer-events:none}
-@media (max-width:700px){#bar{flex-wrap:wrap}#tabs{order:9;flex:1 0 100%}}
+/* Tokens: M3 tonal scheme from a cool blue seed. Dark is the default (you watch a browser here), light follows the system. */
+:root{
+  color-scheme:dark;
+  --surface:#0e1014; --surface-low:#16181d; --surface-c:#1b1e23; --surface-high:#24272d; --surface-highest:#2f3238;
+  --on-surface:#e3e2e9; --on-variant:#a9acb6; --dim:#7b7f8a;
+  --primary:#a8c8ff; --on-primary:#06305f; --secondary-c:#334460; --on-secondary-c:#d6e3ff;
+  --ok:#6fdc8c; --warn:#ffb95c; --error:#ffb4ab; --error-c:#5c1a17; --on-error-c:#ffdad6;
+  --shadow:0 1px 2px rgb(0 0 0/.35),0 10px 30px -8px rgb(0 0 0/.55);
+  --pill-bg:rgb(36 39 45/.86);
+  --ease:cubic-bezier(.2,0,0,1); --spring:cubic-bezier(.34,1.4,.64,1);
+  --font:Inter,"Inter Variable","Google Sans Flex","Google Sans Text","SF Pro Text",system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+}
+@media (prefers-color-scheme:light){:root{
+  color-scheme:light;
+  --surface:#eceef4; --surface-low:#f6f7fb; --surface-c:#ffffff; --surface-high:#e6e8f0; --surface-highest:#dcdfe8;
+  --on-surface:#1a1c21; --on-variant:#454852; --dim:#6c707b;
+  --primary:#2f5c9a; --on-primary:#fff; --secondary-c:#d6e3ff; --on-secondary-c:#0f2c55;
+  --ok:#1f9d55; --warn:#a15c00; --error:#ba1a1a; --error-c:#ffdad6; --on-error-c:#410002;
+  --shadow:0 1px 2px rgb(20 30 60/.12),0 10px 30px -10px rgb(20 30 60/.25);
+  --pill-bg:rgb(255 255 255/.9);
+}}
+*,*::before,*::after{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden}
+body{
+  display:grid;grid-template-rows:auto auto minmax(0,1fr);grid-template-columns:minmax(0,1fr);
+  background:var(--surface);color:var(--on-surface);
+  font:400 14px/1.4 var(--font);-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
+  -webkit-tap-highlight-color:transparent;
+}
+svg.i{width:20px;height:20px;flex:none;fill:currentColor}
 [hidden]{display:none!important}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+:focus-visible{outline:2px solid var(--primary);outline-offset:2px}
+
+/* ---- top bar */
+#bar{display:flex;align-items:center;gap:12px;padding:10px 16px 8px;min-width:0}
+.who{position:relative;display:flex;align-items:center;flex:none;height:40px;border-radius:999px;background:var(--surface-high)}
+#st{position:absolute;left:15px;top:50%;width:10px;height:10px;margin-top:-5px;border-radius:50%;background:var(--dim);pointer-events:none;transition:background-color .3s,box-shadow .3s}
+#st.on{background:var(--ok);box-shadow:0 0 0 4px color-mix(in srgb,var(--ok) 22%,transparent)}
+body[data-conn=wait] #st,body[data-conn=retry] #st{animation:pulse 1.2s ease-in-out infinite}
+body[data-conn=retry] #st{background:var(--warn)}
+body[data-conn=off] #st,body[data-conn=out] #st,body[data-conn=err] #st{background:var(--error)}
+@keyframes pulse{50%{opacity:.35}}
+select{font:inherit;color:inherit;background:transparent;border:0;margin:0;cursor:pointer;appearance:none;-webkit-appearance:none;field-sizing:content}
+select option{background:var(--surface-high);color:var(--on-surface)}
+.who select{height:40px;padding:0 36px 0 34px;border-radius:999px;font-weight:600;max-width:220px;text-overflow:ellipsis}
+.who select:empty{width:40px;padding:0}
+.who select:empty~.chev{display:none}
+svg.chev{position:absolute;right:14px;top:50%;width:14px;height:14px;margin-top:-7px;pointer-events:none;color:var(--on-variant)}
+
+#tabs{display:flex;gap:4px;flex:1;min-width:0;overflow-x:auto;scrollbar-width:none;
+  mask-image:linear-gradient(to right,#000 calc(100% - 28px),transparent);-webkit-mask-image:linear-gradient(to right,#000 calc(100% - 28px),transparent)}
+#tabs::-webkit-scrollbar{display:none}
+.chip{flex:none;max-width:220px;height:36px;line-height:36px;padding:0 16px;border-radius:999px;cursor:pointer;
+  overflow:hidden;white-space:nowrap;text-overflow:ellipsis;color:var(--on-variant);font-weight:500;user-select:none;
+  transition:background-color .18s var(--ease),color .18s var(--ease),border-radius .25s var(--ease)}
+.chip.cur{background:var(--secondary-c);color:var(--on-secondary-c);font-weight:600}
+.chip.act::before,.cell.act .cap::before{content:"";display:inline-block;width:7px;height:7px;margin:0 8px 1px 0;border-radius:50%;
+  background:var(--ok);vertical-align:middle;box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 20%,transparent)}
+.chip:active{border-radius:12px}
+
+/* ---- controls (a floating pill on phones) */
+#ctl{display:flex;align-items:center;gap:6px;flex:none}
+.btn{position:relative;display:inline-flex;align-items:center;justify-content:center;gap:8px;height:40px;min-width:40px;padding:0 16px;
+  border:0;border-radius:999px;background:var(--surface-high);color:var(--on-surface);font:600 14px/1 var(--font);cursor:pointer;
+  white-space:nowrap;user-select:none;-webkit-user-select:none;
+  transition:background-color .18s var(--ease),color .18s var(--ease),border-radius .3s var(--spring),transform .12s var(--ease)}
+.btn.ic{width:40px;padding:0}
+.btn:active{border-radius:12px;transform:scale(.96)}
+.btn[aria-pressed=true],#kbd.on,.tog:has(input:checked){background:var(--secondary-c);color:var(--on-secondary-c)}
+.tog{padding:0 16px 0 12px}
+.tog input{position:absolute;opacity:0;width:1px;height:1px;margin:0;pointer-events:none}
+.tog:has(input:focus-visible){outline:2px solid var(--primary);outline-offset:2px}
+.tog .off{display:none}
+.tog:not(:has(input:checked)) .on{display:none}
+.tog:not(:has(input:checked)) .off{display:block}
+#mosaic .one,#mosaic[aria-pressed=true] .many{display:none}
+#mosaic[aria-pressed=true] .one{display:block}
+.sel{padding:0}
+.sel select{height:40px;padding:0 36px 0 42px;border-radius:999px;font-weight:600}
+.sel .lead{position:absolute;left:14px;top:50%;margin-top:-10px;pointer-events:none;color:var(--on-variant)}
+@media (hover:hover){
+  .chip:not(.cur):hover{background:var(--surface-high);color:var(--on-surface)}
+  .btn:hover{background:var(--surface-highest)}
+  .btn[aria-pressed=true]:hover,#kbd.on:hover,.tog:has(input:checked):hover{background:color-mix(in srgb,var(--secondary-c) 88%,var(--on-secondary-c))}
+  .who:hover{background:var(--surface-highest)}
+}
+/* customizable select where supported, native picker on touch */
+@supports (appearance:base-select){@media (pointer:fine){
+  .who select,.sel select,.who select::picker(select),.sel select::picker(select){appearance:base-select}
+  .who select,.sel select{display:flex;align-items:center}
+  .who select::picker-icon,.sel select::picker-icon{display:none}
+  .who select::picker(select),.sel select::picker(select){margin-top:6px;padding:6px;border:0;border-radius:18px;min-width:160px;
+    background:var(--surface-highest);color:var(--on-surface);box-shadow:var(--shadow)}
+  .who select option,.sel select option{display:flex;align-items:center;gap:8px;padding:9px 12px;border-radius:12px;background:transparent;font-weight:500}
+  .who select option:hover,.sel select option:hover{background:color-mix(in srgb,var(--on-surface) 9%,transparent)}
+  .who select option:checked,.sel select option:checked{background:var(--secondary-c);color:var(--on-secondary-c)}
+  .who select option::checkmark,.sel select option::checkmark{display:none}
+}}
+
+/* ---- address row */
+#info{display:flex;align-items:center;gap:10px;height:36px;margin:0 16px 10px;padding:0 16px 0 14px;border-radius:999px;
+  background:var(--surface-c);color:var(--on-variant);min-width:0;transition:background-color .25s var(--ease),color .25s var(--ease)}
+#info svg.i{width:16px;height:16px;display:none}
+#url{flex:1;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:13.5px;letter-spacing:.005em}
+#url b{font-weight:500;color:var(--on-surface)}
+body[data-conn=on] #info:not([data-scheme]) .web,body[data-conn=on] #info[data-scheme=http] .web,body[data-conn=on] #info[data-scheme=https] .lock,
+body[data-conn=wait] .web,body[data-conn=retry] .spin,body[data-conn=off] .off,body[data-conn=out] .out,body[data-conn=err] .err{display:block!important}
+body:not([data-conn=on]) #url::first-letter{text-transform:uppercase}
+body[data-conn=retry] #info{background:color-mix(in srgb,var(--warn) 14%,var(--surface-c));color:var(--warn)}
+body[data-conn=off] #info,body[data-conn=err] #info{background:var(--error-c);color:var(--on-error-c)}
+.spin{animation:spin .9s linear infinite}
+@keyframes spin{to{transform:rotate(1turn)}}
+
+/* ---- stage */
+#stage{container-type:size;display:grid;place-items:center;min-height:0;padding:0 16px 16px;overflow:hidden}
+#main{--ar:1.6;width:min(100cqw,100cqh * var(--ar));height:auto;max-height:100cqh;display:block;
+  border-radius:14px;background:var(--surface-c);box-shadow:var(--shadow);outline:none;
+  touch-action:none;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;
+  transition:opacity .3s var(--ease),filter .3s var(--ease)}
+body:not([data-conn=on]) #main{opacity:.4;filter:saturate(.3)}
+body[data-conn=wait] #main{opacity:1;filter:none;animation:breathe 1.6s ease-in-out infinite}
+@keyframes breathe{50%{background:var(--surface-high)}}
+#grid{align-self:stretch;justify-self:stretch;display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px;
+  align-content:start;overflow:auto;scrollbar-width:thin;padding:2px}
+.cell{display:flex;flex-direction:column;gap:2px;padding:8px 8px 4px;border-radius:20px;background:var(--surface-c);cursor:pointer;
+  transition:background-color .18s var(--ease),transform .25s var(--spring),border-radius .3s var(--spring)}
+.cell canvas{width:100%;display:block;aspect-ratio:16/10;object-fit:contain;border-radius:12px;background:var(--surface-low)}
+.cell .cap{padding:8px 6px 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:500;color:var(--on-surface)}
+.cell:active{border-radius:14px;transform:scale(.985)}
+@media (hover:hover){.cell:hover{background:var(--surface-high);transform:translateY(-2px)}}
+
+/* signed out: the message becomes the page */
+body[data-conn=out] #main,body[data-conn=out] #ctl,body[data-conn=out] #tabs,body[data-conn=out] .who{visibility:hidden}
+body[data-conn=out] #info{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:5;margin:0;
+  width:min(380px,calc(100vw - 48px));height:auto;flex-direction:column;gap:16px;padding:32px 28px 28px;border-radius:28px;
+  background:var(--surface-high);color:var(--on-surface);text-align:center;box-shadow:var(--shadow)}
+body[data-conn=out] #info svg.out{width:28px;height:28px;padding:14px;box-sizing:content-box;border-radius:50%;
+  background:var(--error-c);color:var(--on-error-c)}
+body[data-conn=out] #url{white-space:normal;font-size:15px;line-height:1.5;text-wrap:pretty;color:var(--on-variant);flex:none;width:100%}
+
+#kb{position:fixed;left:0;bottom:0;width:1px;height:1px;opacity:0;border:0;padding:0;margin:0;resize:none;font-size:16px;pointer-events:none}
+
+/* ---- phones: address next to the browser, tabs below, controls in a floating pill */
+@media (max-width:700px){
+  body{grid-template-columns:auto minmax(0,1fr);grid-template-rows:auto auto minmax(0,1fr);
+    grid-template-areas:"who info" "tabs tabs" "stage stage"}
+  #bar{display:contents}
+  .who{grid-area:who;margin:calc(10px + env(safe-area-inset-top)) 0 0 calc(12px + env(safe-area-inset-left))}
+  .who select{max-width:34vw}
+  #info{grid-area:info;height:40px;margin:calc(10px + env(safe-area-inset-top)) calc(12px + env(safe-area-inset-right)) 0 8px;padding:0 14px 0 12px}
+  #tabs{grid-area:tabs;padding:8px 12px 0;mask-image:linear-gradient(to right,#000 calc(100% - 24px),transparent);-webkit-mask-image:linear-gradient(to right,#000 calc(100% - 24px),transparent)}
+  #stage{grid-area:stage;padding:10px 8px calc(84px + env(safe-area-inset-bottom))}
+  #main{border-radius:12px}
+  #grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+  .cell{padding:6px 6px 2px;border-radius:16px}.cell canvas{border-radius:10px}.cell .cap{padding:6px 4px 4px;font-size:13px}
+  #ctl{position:fixed;z-index:4;left:50%;bottom:calc(14px + env(safe-area-inset-bottom));transform:translateX(-50%);
+    gap:4px;padding:6px;border-radius:999px;background:var(--pill-bg);box-shadow:var(--shadow);
+    -webkit-backdrop-filter:blur(16px) saturate(1.4);backdrop-filter:blur(16px) saturate(1.4)}
+  #ctl .btn{height:44px;min-width:44px;background:transparent}
+  #ctl .btn.ic,#ctl .tog,#ctl #mosaic{width:44px;padding:0}
+  #ctl .tog .lbl,#ctl #mosaic .lbl{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%)}
+  #ctl .sel select{height:44px;padding:0 14px 0 40px}
+  #ctl .sel svg.chev{display:none}
+  #ctl .btn[aria-pressed=true],#ctl #kbd.on,#ctl .tog:has(input:checked){background:var(--secondary-c)}
+  body[data-conn=out] #info{margin:0}
+}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
 </style>
+<body data-conn="wait">
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <!-- Phosphor Icons (regular), MIT: https://phosphoricons.com -->
+  <symbol id="i-caret" viewBox="0 0 256 256"><path d="M213.66,101.66l-80,80a8,8,0,0,1-11.32,0l-80-80A8,8,0,0,1,53.66,90.34L128,164.69l74.34-74.35a8,8,0,0,1,11.32,11.32Z"/></symbol>
+  <symbol id="i-reload" viewBox="0 0 256 256"><path d="M240,56v48a8,8,0,0,1-8,8H184a8,8,0,0,1,0-16H211.4L184.81,71.64l-.25-.24a80,80,0,1,0-1.67,114.78,8,8,0,0,1,11,11.63A95.44,95.44,0,0,1,128,224h-1.32A96,96,0,1,1,195.75,60L224,85.8V56a8,8,0,1,1,16,0Z"/></symbol>
+  <symbol id="i-grid" viewBox="0 0 256 256"><path d="M104,40H56A16,16,0,0,0,40,56v48a16,16,0,0,0,16,16h48a16,16,0,0,0,16-16V56A16,16,0,0,0,104,40Zm0,64H56V56h48v48Zm96-64H152a16,16,0,0,0-16,16v48a16,16,0,0,0,16,16h48a16,16,0,0,0,16-16V56A16,16,0,0,0,200,40Zm0,64H152V56h48v48Zm-96,32H56a16,16,0,0,0-16,16v48a16,16,0,0,0,16,16h48a16,16,0,0,0,16-16V152A16,16,0,0,0,104,136Zm0,64H56V152h48v48Zm96-64H152a16,16,0,0,0-16,16v48a16,16,0,0,0,16,16h48a16,16,0,0,0,16-16V152A16,16,0,0,0,200,136Zm0,64H152V152h48v48Z"/></symbol>
+  <symbol id="i-window" viewBox="0 0 256 256"><path d="M216,40H40A16,16,0,0,0,24,56V200a16,16,0,0,0,16,16H216a16,16,0,0,0,16-16V56A16,16,0,0,0,216,40Zm0,160H40V56H216V200ZM80,84A12,12,0,1,1,68,72,12,12,0,0,1,80,84Zm40,0a12,12,0,1,1-12-12A12,12,0,0,1,120,84Z"/></symbol>
+  <symbol id="i-kbd" viewBox="0 0 256 256"><path d="M224,48H32A16,16,0,0,0,16,64V192a16,16,0,0,0,16,16H224a16,16,0,0,0,16-16V64A16,16,0,0,0,224,48Zm0,144H32V64H224V192Zm-16-64a8,8,0,0,1-8,8H56a8,8,0,0,1,0-16H200A8,8,0,0,1,208,128Zm0-32a8,8,0,0,1-8,8H56a8,8,0,0,1,0-16H200A8,8,0,0,1,208,96ZM72,160a8,8,0,0,1-8,8H56a8,8,0,0,1,0-16h8A8,8,0,0,1,72,160Zm96,0a8,8,0,0,1-8,8H96a8,8,0,0,1,0-16h64A8,8,0,0,1,168,160Zm40,0a8,8,0,0,1-8,8h-8a8,8,0,0,1,0-16h8A8,8,0,0,1,208,160Z"/></symbol>
+  <symbol id="i-gauge" viewBox="0 0 256 256"><path d="M207.06,72.67A111.24,111.24,0,0,0,128,40h-.4C66.07,40.21,16,91,16,153.13V176a16,16,0,0,0,16,16H224a16,16,0,0,0,16-16V152A111.25,111.25,0,0,0,207.06,72.67ZM224,176H119.71l54.76-75.3a8,8,0,0,0-12.94-9.42L99.92,176H32V153.13c0-3.08.15-6.12.43-9.13H56a8,8,0,0,0,0-16H35.27c10.32-38.86,44-68.24,84.73-71.66V80a8,8,0,0,0,16,0V56.33A96.14,96.14,0,0,1,221,128H200a8,8,0,0,0,0,16h23.67c.21,2.65.33,5.31.33,8Z"/></symbol>
+  <symbol id="i-follow" viewBox="0 0 256 256"><path d="M128,24A104,104,0,1,0,232,128,104.11,104.11,0,0,0,128,24Zm8,191.63V184a8,8,0,0,0-16,0v31.63A88.13,88.13,0,0,1,40.37,136H72a8,8,0,0,0,0-16H40.37A88.13,88.13,0,0,1,120,40.37V72a8,8,0,0,0,16,0V40.37A88.13,88.13,0,0,1,215.63,120H184a8,8,0,0,0,0,16h31.63A88.13,88.13,0,0,1,136,215.63Z"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 256 256"><path d="M208,80H176V56a48,48,0,0,0-96,0V80H48A16,16,0,0,0,32,96V208a16,16,0,0,0,16,16H208a16,16,0,0,0,16-16V96A16,16,0,0,0,208,80ZM96,56a32,32,0,0,1,64,0V80H96ZM208,208H48V96H208V208Z"/></symbol>
+  <symbol id="i-globe" viewBox="0 0 256 256"><path d="M128,24h0A104,104,0,1,0,232,128,104.12,104.12,0,0,0,128,24Zm87.62,96H175.79C174,83.49,159.94,57.67,148.41,42.4A88.19,88.19,0,0,1,215.63,120ZM96.23,136h63.54c-2.31,41.61-22.23,67.11-31.77,77C118.45,203.1,98.54,177.6,96.23,136Zm0-16C98.54,78.39,118.46,52.89,128,43c9.55,9.93,29.46,35.43,31.77,77Zm11.36-77.6C96.06,57.67,82,83.49,80.21,120H40.37A88.19,88.19,0,0,1,107.59,42.4ZM40.37,136H80.21c1.82,36.51,15.85,62.33,27.38,77.6A88.19,88.19,0,0,1,40.37,136Zm108,77.6c11.53-15.27,25.56-41.09,27.38-77.6h39.84A88.19,88.19,0,0,1,148.41,213.6Z"/></symbol>
+  <symbol id="i-notch" viewBox="0 0 256 256"><path d="M232,128a104,104,0,0,1-208,0c0-41,23.81-78.36,60.66-95.27a8,8,0,0,1,6.68,14.54C60.15,61.59,40,93.27,40,128a88,88,0,0,0,176,0c0-34.73-20.15-66.41-51.34-80.73a8,8,0,0,1,6.68-14.54C208.19,49.64,232,87,232,128Z"/></symbol>
+  <symbol id="i-nosignal" viewBox="0 0 256 256"><path d="M88,152v48a8,8,0,0,1-16,0V152a8,8,0,0,1,16,0ZM40,184a8,8,0,0,0-8,8v8a8,8,0,0,0,16,0v-8A8,8,0,0,0,40,184Zm173.92,26.62-160-176A8,8,0,1,0,42.08,45.38L112,122.29V200a8,8,0,0,0,16,0V139.89l24,26.4V200a8,8,0,0,0,16,0V183.89l34.08,37.49a8,8,0,1,0,11.84-10.76Zm-53.92-87a8,8,0,0,0,8-8V72a8,8,0,0,0-16,0v43.63A8,8,0,0,0,160,123.63Zm40,44a8,8,0,0,0,8-8V32a8,8,0,0,0-16,0V159.63A8,8,0,0,0,200,167.63Z"/></symbol>
+  <symbol id="i-unlink" viewBox="0 0 256 256"><path d="M198.63,57.37a32,32,0,0,0-45.19-.06L141.79,69.52a8,8,0,0,1-11.58-11l11.72-12.29a1.59,1.59,0,0,1,.13-.13,48,48,0,0,1,67.88,67.88,1.59,1.59,0,0,1-.13.13l-12.29,11.72a8,8,0,0,1-11-11.58l12.21-11.65A32,32,0,0,0,198.63,57.37ZM114.21,186.48l-11.65,12.21a32,32,0,0,1-45.25-45.25l12.21-11.65a8,8,0,0,0-11-11.58L46.19,141.93a1.59,1.59,0,0,0-.13.13,48,48,0,0,0,67.88,67.88,1.59,1.59,0,0,0,.13-.13l11.72-12.29a8,8,0,1,0-11.58-11ZM216,152H192a8,8,0,0,0,0,16h24a8,8,0,0,0,0-16ZM40,104H64a8,8,0,0,0,0-16H40a8,8,0,0,0,0,16Zm120,80a8,8,0,0,0-8,8v24a8,8,0,0,0,16,0V192A8,8,0,0,0,160,184ZM96,72a8,8,0,0,0,8-8V40a8,8,0,0,0-16,0V64A8,8,0,0,0,96,72Z"/></symbol>
+  <symbol id="i-warn" viewBox="0 0 256 256"><path d="M128,24A104,104,0,1,0,232,128,104.11,104.11,0,0,0,128,24Zm0,192a88,88,0,1,1,88-88A88.1,88.1,0,0,1,128,216Zm-8-80V80a8,8,0,0,1,16,0v56a8,8,0,0,1-16,0Zm20,36a12,12,0,1,1-12-12A12,12,0,0,1,140,172Z"/></symbol>
+</svg>
 <div id="bar">
-  <span id="st" title="connection"></span>
-  <select id="inst" title="browser"></select>
+  <div class="who">
+    <span id="st" title="connection" role="img" aria-label="connection"></span>
+    <select id="inst" title="browser" aria-label="browser"></select>
+    <svg class="i chev" aria-hidden="true"><use href="#i-caret"/></svg>
+  </div>
   <div id="tabs"></div>
-  <label title="follow the tab the agent is working on"><input type="checkbox" id="follow" checked> follow</label>
-  <button id="kbd" title="keyboard" hidden>⌨</button>
-  <button id="mosaic" title="show all tabs">Mosaic</button>
-  <select id="q" title="stream quality">
-    <option value="auto">Auto</option><option value="high">High</option><option value="med">Medium</option><option value="low">Low</option>
-  </select>
-  <button id="reload">Reload</button>
+  <div id="ctl">
+    <label class="btn tog" title="follow the tab the agent is working on"><input type="checkbox" id="follow" checked><svg class="i" aria-hidden="true"><use href="#i-follow"/></svg><span class="lbl">Follow</span></label>
+    <button id="kbd" class="btn ic" title="keyboard" aria-label="keyboard" aria-pressed="false" hidden><svg class="i" aria-hidden="true"><use href="#i-kbd"/></svg></button>
+    <button id="mosaic" class="btn" title="show all tabs" aria-pressed="false"><svg class="i many" aria-hidden="true"><use href="#i-grid"/></svg><svg class="i one" aria-hidden="true"><use href="#i-window"/></svg><span class="lbl">Mosaic</span></button>
+    <span class="btn sel"><svg class="i lead" aria-hidden="true"><use href="#i-gauge"/></svg><select id="q" title="stream quality" aria-label="stream quality">
+      <option value="auto">Auto</option><option value="high">High</option><option value="med">Medium</option><option value="low">Low</option>
+    </select><svg class="i chev" aria-hidden="true"><use href="#i-caret"/></svg></span>
+    <button id="reload" class="btn ic" title="Reload" aria-label="Reload"><svg class="i" aria-hidden="true"><use href="#i-reload"/></svg></button>
+  </div>
 </div>
-<div id="info"><span id="url"></span></div>
+<div id="info" role="status"><svg class="i lock" aria-hidden="true"><use href="#i-lock"/></svg><svg class="i web" aria-hidden="true"><use href="#i-globe"/></svg><svg class="i spin" aria-hidden="true"><use href="#i-notch"/></svg><svg class="i off" aria-hidden="true"><use href="#i-nosignal"/></svg><svg class="i out" aria-hidden="true"><use href="#i-unlink"/></svg><svg class="i err" aria-hidden="true"><use href="#i-warn"/></svg><span id="url"></span></div>
 <textarea id="kb" rows="1" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" enterkeyhint="go" aria-hidden="true" tabindex="-1"></textarea>
 <div id="stage"><canvas id="main" tabindex="0" width="640" height="400"></canvas><div id="grid" hidden></div></div>
 <script>
@@ -53,7 +222,9 @@ async function signIn() {
   P.delete('b'); history.replaceState(null, '', location.pathname + (P.toString() ? '?' + P : ''));
   try { await fetch('/api/session', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({b})}); } catch (e) { /* authed() decides */ }
 }
-const signedOut = () => { $('url').textContent = 'not signed in: this link has expired or was already used. Ask for a new one (hermes browser-viewer link).'; };
+// UI only: the connection state drives the status dot, the address row and the stage (wait, on, retry, off, out, err)
+const conn = s => { document.body.dataset.conn = s; $('st').title = $('st').ariaLabel = s === 'on' ? 'connected' : s === 'retry' ? 'reconnecting' : s === 'wait' ? 'connecting' : 'not connected'; };
+const signedOut = () => { conn('out'); $('url').textContent = 'not signed in: this link has expired or was already used. Ask for a new one (hermes browser-viewer link).'; };
 let INST = P.get('i') || '', ws = null, retry = 0, manual = false;
 let tabs = [], active = null, pin = null, mode = 'single', qual = 'auto', autoPin = null, autoTimer = 0;
 let idx2tid = {}, cssW = 1280, cssH = 800;
@@ -75,12 +246,12 @@ function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}/ws` + (INST ? `?i=${encodeURIComponent(INST)}` : ''));
   ws.binaryType = 'arraybuffer';
-  ws.onopen = () => { $('st').classList.add('on'); retry = 0; sendView(); };
+  ws.onopen = () => { $('st').classList.add('on'); conn('on'); retry = 0; sendView(); };
   ws.onclose = () => {
     $('st').classList.remove('on');
     if (manual) { manual = false; connect(); return; }
-    if (retry < 20) { retry++; $('url').textContent = 'reconnecting...'; setTimeout(async () => { if (await authed()) connect(); else signedOut(); }, 1500); }
-    else $('url').textContent = 'disconnected: reload the page';
+    if (retry < 20) { retry++; conn('retry'); $('url').textContent = 'reconnecting...'; setTimeout(async () => { if (await authed()) connect(); else signedOut(); }, 1500); }
+    else { conn('off'); $('url').textContent = 'disconnected: reload the page'; }
   };
   ws.onmessage = e => (e.data instanceof ArrayBuffer) ? onFrame(e.data) : onMsg(JSON.parse(e.data));
 }
@@ -92,12 +263,12 @@ function onMsg(m) {
     m.instances.forEach(n => { const o = document.createElement('option'); o.value = o.textContent = n; s.appendChild(o); });
     s.value = INST;
   } else if (m.t === 'tabs') {
-    tabs = m.tabs; active = m.active; idx2tid = {};
+    tabs = m.tabs; active = m.active; idx2tid = {}; conn('on');
     tabs.forEach(t => idx2tid[t.idx] = t.id);
     if (pin && !tabs.some(t => t.id === pin)) { pin = autoPin = null; $('follow').checked = true; sendView(); }
     renderTabs(); renderGrid(); showUrl();
   } else if (m.t === 'err') {
-    $('url').textContent = m.u;
+    conn('err'); $('url').textContent = m.u;
     if (m.instances && m.instances.length > 1) INST = '';
   }
 }
@@ -108,11 +279,26 @@ function renderTabs() {
     const d = document.createElement('div');
     d.className = 'chip' + (t.id === curTid() ? ' cur' : '') + (t.id === active ? ' act' : '');
     d.textContent = label(t); d.title = t.url;
-    d.onclick = () => { pin = t.id; autoPin = null; $('follow').checked = false; mode = 'single'; $('mosaic').textContent = 'Mosaic'; sendView(); renderAll(); };
+    d.onclick = () => { pin = t.id; autoPin = null; $('follow').checked = false; mode = 'single'; sendView(); renderAll(); };
     box.appendChild(d);
   });
 }
-function showUrl() { const t = tabs.find(x => x.id === curTid()); $('url').textContent = t ? t.url : ''; }
+function showUrl() { const t = tabs.find(x => x.id === curTid()); paintUrl(t ? t.url : ''); }
+function paintUrl(u) {     // UI only: the host stands out, the scheme picks the icon
+  const el = $('url'), info = $('info'); el.textContent = ''; el.title = u; delete info.dataset.scheme;
+  try {
+    const x = new URL(u);
+    if (x.protocol === 'http:' || x.protocol === 'https:') {
+      info.dataset.scheme = x.protocol.slice(0, -1);
+      const b = document.createElement('b'); b.textContent = x.host;
+      el.append(b, (x.pathname === '/' ? '' : x.pathname) + x.search + x.hash);
+      return;
+    }
+  } catch (e) { /* not a URL: shown as it is */ }
+  el.textContent = u;
+}
+// UI only: the canvas box keeps the picture's shape, so it can grow to the stage without letterboxing
+new MutationObserver(() => main.style.setProperty('--ar', main.width / main.height)).observe(main, {attributes: true, attributeFilter: ['width', 'height']});
 function renderGrid() {
   if (mode !== 'mosaic') return;
   const want = tabs.slice().reverse().slice(0, 12);
@@ -124,14 +310,15 @@ function renderGrid() {
       const cv = document.createElement('canvas'); cv.width = 400; cv.height = 300;
       const cap = document.createElement('div'); cap.className = 'cap';
       el.append(cv, cap);
-      el.onclick = () => { pin = t.id; autoPin = null; $('follow').checked = false; mode = 'single'; $('mosaic').textContent = 'Mosaic'; sendView(); renderAll(); };
+      el.onclick = () => { pin = t.id; autoPin = null; $('follow').checked = false; mode = 'single'; sendView(); renderAll(); };
       grid.appendChild(el); c = cells[t.id] = {el, cv, cap};
     }
-    c.cap.textContent = label(t);
+    c.cap.textContent = label(t); c.el.classList.toggle('act', t.id === active);
   });
 }
 function renderAll() {
   main.hidden = mode === 'mosaic'; grid.hidden = mode !== 'mosaic';
+  $('mosaic').querySelector('.lbl').textContent = mode === 'mosaic' ? 'Tabs' : 'Mosaic'; $('mosaic').setAttribute('aria-pressed', mode === 'mosaic');
   if (mode === 'mosaic') { Object.values(cells).forEach(c => c.el.remove()); Object.keys(cells).forEach(k => delete cells[k]); }
   renderTabs(); renderGrid(); showUrl();
 }
@@ -159,7 +346,7 @@ async function onFrame(buf) {
 // ---- controls
 $('inst').onchange = e => { INST = e.target.value; pin = null; tabs = []; manual = true; ws.close(); };
 $('follow').onchange = e => { autoPin = null; if (e.target.checked) { pin = null; sendView(); renderAll(); } else { pin = curTid(); sendView(); } };
-$('mosaic').onclick = () => { mode = mode === 'single' ? 'mosaic' : 'single'; $('mosaic').textContent = mode === 'mosaic' ? 'Tabs' : 'Mosaic'; sendView(); renderAll(); };
+$('mosaic').onclick = () => { mode = mode === 'single' ? 'mosaic' : 'single'; sendView(); renderAll(); };
 $('q').onchange = e => { qual = e.target.value; sendView(); };
 $('reload').onclick = () => send({t: 'reload'});
 
@@ -242,7 +429,7 @@ kb.addEventListener('compositionstart', () => { composing = true; });
 kb.addEventListener('compositionend', () => { composing = false; kbSync(); });
 kb.addEventListener('keydown', e => { if (e.key in SP) { e.preventDefault(); touch(); pressKey(e.key, SP[e.key], e.code, e.key === 'Enter' ? '\r' : ''); } });
 $('kbd').onclick = () => {
-  kbOn = !kbOn; $('kbd').classList.toggle('on', kbOn);
+  kbOn = !kbOn; $('kbd').classList.toggle('on', kbOn); $('kbd').setAttribute('aria-pressed', kbOn);
   if (kbOn) { kbReset(); kb.focus({preventScroll: true}); } else kb.blur();
 };
 document.addEventListener('keydown', e => {
