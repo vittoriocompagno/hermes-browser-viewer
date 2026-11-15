@@ -315,10 +315,55 @@ def _profile_major(profile: Optional[Path]) -> int:
         return 0
 
 
-def chromium_path(profile: Optional[Path] = None) -> Optional[str]:
-    """Pick a browser. A profile written by a newer Chrome must not be opened by an older one (it crashes)."""
-    cands = _chromium_candidates()
+def _headless_shell_candidates() -> List[str]:
+    """chrome-headless-shell builds, newest first: same Blink as Chromium without the browser UI, about half the RAM.
+    BV_HEADLESS_SHELL=0 turns them off, BV_HEADLESS_SHELL=/path picks one."""
+    env = os.environ.get("BV_HEADLESS_SHELL", "")
+    if env == "0":
+        return []
+    out: List[str] = [env] if env and os.access(env, os.X_OK) else []
+    w = shutil.which("chrome-headless-shell")
+    if w and w not in out:
+        out.append(w)
+    found = []
+    for pat in ("chs/chrome-headless-shell/*/chrome-headless-shell-*/chrome-headless-shell",   # @puppeteer/browsers --path tools/chs
+                "chrome-headless-shell-*/chrome-headless-shell"):
+        found += glob.glob(str(hermes_home() / "tools" / pat))
+    for cand in sorted((c for c in found if os.access(c, os.X_OK)), key=_major, reverse=True):
+        if cand not in out:
+            out.append(cand)
+    return out
+
+
+def is_headless_shell(exe: Optional[str]) -> bool:
+    return bool(exe) and "headless-shell" in Path(exe).name
+
+
+def headless_user_agent(exe: str) -> Optional[str]:
+    """A headless browser says HeadlessChrome in its user agent and some sites (Amazon) treat it as a bot:
+    send the user agent of the same Chrome with a window. BV_USER_AGENT overrides it."""
+    if os.environ.get("BV_USER_AGENT"):
+        return os.environ["BV_USER_AGENT"]
+    major = _major(exe)
+    if not major:
+        return None
+    plat = "Macintosh; Intel Mac OS X 10_15_7" if sys.platform == "darwin" else "X11; Linux x86_64"
+    return f"Mozilla/5.0 ({plat}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+
+
+def chromium_path(profile: Optional[Path] = None, headless: bool = False) -> Optional[str]:
+    """Pick a browser. A profile written by a newer Chrome must not be opened by an older one (it crashes).
+    Headless instances prefer chrome-headless-shell, choosing one no newer than the regular browser when possible,
+    so the profile still opens in the regular browser (e.g. to log in with a window)."""
     need = _profile_major(profile)
+    explicit = os.environ.get("BV_HEADLESS_SHELL", "") not in ("", "0")
+    if headless and (explicit or not os.environ.get("BV_CHROMIUM")):    # an explicit BV_CHROMIUM wins over found shells
+        regular = max((_major(c) for c in _chromium_candidates()), default=0)
+        shells = [s for s in _headless_shell_candidates() if _major(s) >= need]
+        pick = next((s for s in shells if not regular or _major(s) <= regular), shells[0] if shells else None)
+        if pick:
+            return pick
+    cands = _chromium_candidates()
     if not cands or not need:
         return cands[0] if cands else None
     for c in cands:
@@ -332,7 +377,7 @@ def instance_info(name: str, inst: Dict[str, Any]) -> Dict[str, Any]:
     alive = cdp_alive(inst["cdp"])
     return {
         "name": name, "cdp": inst["cdp"], "managed": bool(inst.get("managed")), "alive": alive,
-        "pid": inst.get("pid"), "profile": inst.get("profile"),
+        "pid": inst.get("pid"), "profile": inst.get("profile"), "engine": inst.get("engine"),
         "tabs": [{"origin": _origin(t.get("url", "")), "title": str(t.get("title") or "")[:60]} for t in cdp_tabs(inst["cdp"])] if alive else [],
     }
 
@@ -407,6 +452,24 @@ def _owns_port(port: int, pid: int) -> bool:
     return False
 
 
+def _remembered_profiles() -> Dict[str, str]:
+    """Profiles of stopped browsers, so `start <name>` reopens the same logins (instances.json drops stopped ones)."""
+    try:
+        data = json.loads((home() / "profiles.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)} if isinstance(data, dict) else {}
+
+
+def _remember_profile(name: str, profile: Optional[str]) -> None:
+    data = _remembered_profiles()
+    if profile:
+        data[name] = profile
+    else:
+        data.pop(name, None)
+    _write_private(home() / "profiles.json", json.dumps(data, indent=2))
+
+
 def start_instance(name: str, url: str = "about:blank", port: Optional[int] = None, headless: bool = True,
                    size: str = "1280,900", profile: Optional[str] = None) -> Dict[str, Any]:
     """Launch (or reuse) a managed Chromium with a persistent profile and CDP on loopback."""
@@ -420,8 +483,15 @@ def start_instance(name: str, url: str = "about:blank", port: Optional[int] = No
         cur = reg.get(name)
         if cur and cdp_alive(cur["cdp"]):
             return {**instance_info(name, cur), "reused": True}
+        # a name keeps its profile across restarts and stops: falling back to the default would open an empty one
+        # (logins "gone"); the registry entry may be dead (crash, reboot) or removed by stop_instance
+        if not profile:
+            if cur and cur.get("managed") and cur.get("profile"):
+                profile = cur["profile"]
+            else:
+                profile = _remembered_profiles().get(name)
         prof = Path(profile).expanduser() if profile else home() / "profiles" / name
-        exe = chromium_path(prof)
+        exe = chromium_path(prof, headless=headless)
         if not exe:
             raise ViewerError("no Chromium found (set BV_CHROMIUM or install chromium)")
         used = {int(i["port"]) for n, i in reg.items() if n != name}
@@ -439,7 +509,11 @@ def start_instance(name: str, url: str = "about:blank", port: Optional[int] = No
                 "--disable-background-timer-throttling", "--disable-renderer-backgrounding",
                 "--disable-backgrounding-occluded-windows"]
         if headless:
-            args.append("--headless=new")
+            if not is_headless_shell(exe):      # the shell is headless by construction
+                args.append("--headless=new")
+            ua = headless_user_agent(exe)
+            if ua:
+                args.append(f"--user-agent={ua}")
         args.append(url)
         with open(home() / f"chromium-{name}.log", "ab") as log:
             proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,  # noqa: S603
@@ -462,7 +536,8 @@ def start_instance(name: str, url: str = "about:blank", port: Optional[int] = No
             proc.poll()                      # reap
             raise ViewerError(err)
         reg[name] = {"cdp": cdp, "port": port, "managed": True, "pid": proc.pid, "starttime": _proc_start(proc.pid),
-                     "profile": str(prof), "created": int(time.time())}
+                     "profile": str(prof), "created": int(time.time()),
+                     "engine": "headless-shell" if is_headless_shell(exe) else "chromium"}
         _save_instances(reg)
         return {**instance_info(name, reg[name]), "reused": False}
 
@@ -507,6 +582,7 @@ def stop_instance(name: str, purge: bool = False) -> Dict[str, Any]:
         if purge and prof and Path(prof).resolve().parent == (home() / "profiles").resolve():
             shutil.rmtree(prof, ignore_errors=True)
             purged = True
+        _remember_profile(name, None if purge else (prof if inst.get("managed") else None))
         out = {"name": name, "stopped": killed, "managed": bool(inst.get("managed")), "profile_deleted": purged}
         if stale:
             out["note"] = "the registered pid is no longer our browser (already closed): no process was touched"
@@ -848,5 +924,6 @@ def status() -> Dict[str, Any]:
                     "idle_minutes": info.get("idle_minutes")} if info else {"running": False}),
         "instances": list_instances(),
         "chromium": chromium_path(),
+        "headless_browser": chromium_path(headless=True),
         "data_dir": str(home()),
     }

@@ -809,6 +809,49 @@ class CoreTests(unittest.TestCase):
             self.assertGreaterEqual(bv_core._major(bv_core.chromium_path(prof)), 100)
             self.assertEqual(bv_core.chromium_path(prof / "new"), bv_core._chromium_candidates()[0])
 
+    def _fake_browser(self, d: Path, rel: str, version: str) -> str:
+        exe = d / rel
+        exe.parent.mkdir(parents=True, exist_ok=True)
+        exe.write_text(f"#!/bin/sh\necho 'Chrome {version}'\n")
+        exe.chmod(0o755)
+        return str(exe)
+
+    def test_headless_prefers_the_shell_without_outgrowing_the_regular_browser(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            regular = self._fake_browser(d, "bin/chromium", "155.0.8059.84")
+            old = self._fake_browser(d, "tools/chrome-headless-shell-150/chrome-headless-shell", "150.0.1.2")
+            same = self._fake_browser(d, "tools/chs/chrome-headless-shell/linux-155.0.8059.84/chrome-headless-shell-linux64/chrome-headless-shell", "155.0.8059.84")
+            newer = self._fake_browser(d, "tools/chrome-headless-shell-157/chrome-headless-shell", "157.0.1.2")
+            prof = d / "prof"
+            prof.mkdir()
+            env = {"PATH": str(d / "bin")}
+            with mock.patch.dict(os.environ, env), mock.patch.object(bv_core, "hermes_home", return_value=d), \
+                 mock.patch.dict(bv_core._MAJORS, {}, clear=True):
+                os.environ.pop("BV_CHROMIUM", None)
+                os.environ.pop("BV_HEADLESS_SHELL", None)
+                self.assertEqual(bv_core._headless_shell_candidates(), [newer, same, old])
+                self.assertEqual(bv_core.chromium_path(prof, headless=True), same)     # newest that is <= regular
+                self.assertEqual(bv_core.chromium_path(prof), regular)                 # a window: the regular browser
+                (prof / "Last Version").write_text("156.0.0.0")
+                self.assertEqual(bv_core.chromium_path(prof, headless=True), newer)    # never downgrade a profile
+                with mock.patch.dict(os.environ, {"BV_HEADLESS_SHELL": "0"}):
+                    self.assertEqual(bv_core._headless_shell_candidates(), [])
+                with mock.patch.dict(os.environ, {"BV_CHROMIUM": regular}):
+                    self.assertEqual(bv_core.chromium_path(prof / "x", headless=True), regular)   # explicit choice wins
+                self.assertTrue(bv_core.is_headless_shell(same))
+                self.assertFalse(bv_core.is_headless_shell(regular))
+
+    def test_headless_user_agent_hides_headlesschrome(self):
+        with tempfile.TemporaryDirectory() as d:
+            exe = self._fake_browser(Path(d), "chrome-headless-shell", "155.0.8059.84")
+            with mock.patch.dict(bv_core._MAJORS, {}, clear=True):
+                ua = bv_core.headless_user_agent(exe)
+            self.assertIn("Chrome/155.0.0.0", ua)
+            self.assertNotIn("Headless", ua)
+            with mock.patch.dict(os.environ, {"BV_USER_AGENT": "Custom/1"}):
+                self.assertEqual(bv_core.headless_user_agent(exe), "Custom/1")
+
     def test_stale_pid_is_never_signalled(self):
         """A registry entry whose pid now belongs to another process must not get that process killed."""
         prof = bv_core.home() / "profiles" / "stale"
@@ -892,6 +935,25 @@ class CoreTests(unittest.TestCase):
             bv_core.adopt_instance("ghost", "http://127.0.0.1:9")
         with self.assertRaises(bv_core.ViewerError):
             bv_core.stop_instance("nope")
+
+    def test_a_name_keeps_its_profile_after_stop_and_after_a_crash(self):
+        """Restarting 'login' must reopen its own profile: a fresh default one looks like every login is gone."""
+        custom = Path(TMP) / "custom-profile"
+        a = bv_core.start_instance("keep", profile=str(custom))
+        try:
+            self.assertEqual(a["profile"], str(custom))
+            bv_core.stop_instance("keep")
+            b = bv_core.start_instance("keep")                       # no profile given: the remembered one
+            self.assertEqual(b["profile"], str(custom))
+            bv_core._kill_group(int(b["pid"]))                       # crash: the registry entry is left dead
+            time.sleep(0.5)
+            c = bv_core.start_instance("keep")
+            self.assertFalse(c["reused"])
+            self.assertEqual(c["profile"], str(custom))
+        finally:
+            bv_core.stop_instance("keep", purge=True)
+            shutil.rmtree(custom, ignore_errors=True)
+        self.assertNotIn("keep", bv_core._remembered_profiles())     # purge forgets it
 
     def test_start_is_idempotent_and_stop_kills_browser(self):
         a = bv_core.start_instance("idem")
