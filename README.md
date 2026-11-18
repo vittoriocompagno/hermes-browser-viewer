@@ -1,6 +1,6 @@
 <p align="center">
   <img alt="Hermes 0.23.1 or newer" src="https://img.shields.io/badge/Hermes-%E2%89%A5%200.23.1-1a73e8?style=flat-square">
-  <img alt="plugin version 0.1.0" src="https://img.shields.io/badge/plugin-0.1.0-0a84ff?style=flat-square">
+  <img alt="plugin version 0.3.5" src="https://img.shields.io/badge/plugin-0.3.5-0a84ff?style=flat-square">
   <img alt="Linux | macOS" src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS-34c759?style=flat-square">
   <img alt="MIT license" src="https://img.shields.io/badge/license-MIT-8e8e93?style=flat-square">
 </p>
@@ -104,7 +104,7 @@ The agent asks for a link, you open it, you log in, and the agent keeps working 
 | Item | Details |
 |---|---|
 | Hermes | 0.23.1 or newer (developed and tested on v0.23.1) |
-| Plugin | 0.3.4, MIT |
+| Plugin | 0.3.5, MIT |
 | System | Linux, tested on Arch-based Omarchy, x86_64 (process checks read `/proc`). macOS on Apple Silicon, tested on GitHub's macOS runners (process checks through `psutil`, which Hermes already ships) |
 | Browser | Chromium or Chrome, tested with Chromium 155 |
 | Viewing device | any current browser, touch supported |
