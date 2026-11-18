@@ -24,6 +24,19 @@ logger = logging.getLogger(__name__)
 
 ACTIONS = ["status", "start", "link", "list", "new", "adopt", "use", "stop", "rotate_token"]
 
+HANDOFF_CHECKS = (
+    "Pass the intended page as url to start if a new browser is needed. Before sharing a link, use list to confirm "
+    "the named browser and its CDP endpoint. Inspect a screenshot of the intended tab with browser_exec only after "
+    "confirming it is attached to that endpoint. If it is not attached, ask permission before calling use, which "
+    "changes the shared Hermes browser setting, then open a new browser_exec session. If you cannot inspect the "
+    "tab, say the page is unverified. If it is blank, wrong, or blocked, fix what you can and recheck before sharing. "
+    "A running server does not mean the page rendered. "
+    "For a device on Tailscale, choose the returned Tailscale link (prefer HTTPS/MagicDNS if configured) and "
+    "check /healthz on its origin without opening the one-time link. A loopback link only works on the host; "
+    "if no suitable remote link is available, say so. If the device cannot reach the link, check whether it is "
+    "connected to the same tailnet."
+)
+
 SCHEMA = {
     "name": "browser_viewer",
     "description": (
@@ -39,8 +52,9 @@ SCHEMA = {
         "user asks; then open a NEW browser_exec session name); use with name 'clear' = back to the default clean "
         "browser; stop = stop a browser (also clears browser.cdp_url if it pointed there) or the server; "
         "rotate_token = sign every browser out and return a fresh link.\n"
-        "After 'start', give the user the link and tell them to log in; then call use, and continue with browser_exec. "
-        "The link works once, for 10 minutes, and signs in the browser that opens it: share it only with the user."
+        + HANDOFF_CHECKS + "\n"
+        "Share the link only with the user: it works once, for 10 minutes. After they finish, verify the logged-in "
+        "state in the same tab. Only call 'use' if they authorized changing the shared browser configuration."
     ),
     "parameters": {
         "type": "object",
@@ -81,7 +95,7 @@ def _set_cdp_url(cdp: str | None) -> str:
 def _links_payload(name: str | None) -> Dict[str, Any]:
     info = bv_core.server_info()
     urls = bv_core.links(name)
-    out: Dict[str, Any] = {"links": urls}
+    out: Dict[str, Any] = {"links": urls, "before_sharing": HANDOFF_CHECKS}
     if info:
         hosts = info.get("hosts", [])
         tls_hosts = set((info.get("tls") or {}).get("hosts", []))
@@ -124,8 +138,7 @@ def run_action(args: Dict[str, Any]) -> Dict[str, Any]:
             if srv.get("warnings"):
                 out["warnings"] = srv["warnings"]
         out.update(_links_payload(n))
-        out["next"] = ("when the user has finished logging in, use action='use' to make browser_exec drive this browser "
-                       "(then open a new browser_exec session)")
+        out["next"] = "after the user finishes logging in, verify the signed-in state in the same checked tab"
         return out
 
     if action == "link":

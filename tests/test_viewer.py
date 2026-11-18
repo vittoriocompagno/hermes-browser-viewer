@@ -1716,6 +1716,23 @@ class PluginActionTests(unittest.TestCase):
             self.assertIn(f"http://127.0.0.1:{port}/?b=", buf.getvalue())
             self.assertEqual(core.server_info()["port"], port)
 
+    def test_handoff_instructions_reach_the_agent_without_the_readme(self):
+        core = self.plugin.bv_core
+        server = {"port": 9281, "hosts": ["127.0.0.1"]}
+        with mock.patch.object(core, "start_server", return_value=server), \
+             mock.patch.object(core, "server_info", return_value=server), \
+             mock.patch.object(core, "links", return_value=["http://127.0.0.1:9281/?b=test"]), \
+             mock.patch.object(core, "start_instance", return_value={"name": "login"}):
+            instructions = [self.plugin.SCHEMA["description"]]
+            for action in ("start", "link"):
+                out = json.loads(self.plugin.tool_handler({"action": action, "name": "login"}))
+                instructions.append(out.get("before_sharing", ""))
+            for text in instructions:
+                for term in ("screenshot", "blank", "Tailscale", "loopback", "/healthz",
+                             "CDP endpoint", "ask permission before calling use", "unverified"):
+                    self.assertIn(term, text)
+            self.assertIn("only on this machine", out["warning"])
+
     def calls(self):
         return self.log.read_text().splitlines() if self.log.exists() else []
 

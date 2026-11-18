@@ -43,18 +43,22 @@ Setup, once:
 
 Whenever you need me to log in:
 1. Call browser_viewer with action "start" (browser name "login" unless I say
-   otherwise). It returns the login link.
-2. Send me the link. It works once and expires after 10 minutes; call action "link"
-   for a fresh one, for example for another device. If the only link is on 127.0.0.1,
-   it opens on this machine only: tell me.
-3. Wait while I log in on that page. Never type my password, my 2FA code or any other
-   credential yourself, and never write the link into files, notes or memory.
-4. When I say I am done, take a screenshot and check that the page shows the logged-in
-   state.
-5. If I want you to keep working in that browser with browser_exec, call action "use"
-   with name "login", then open a NEW browser_exec session. "use" sets browser.cdp_url
-   for every Hermes session, cron jobs included, so do it only because I asked or
-   agreed. When we are finished, call "use" with name "clear".
+   otherwise). Pass the intended page as `url` when creating the browser.
+2. Use action "list" to find that browser's CDP endpoint. Only take the screenshot
+   with `browser_exec` after confirming it is attached to that endpoint. If it
+   isn't attached, ask me before calling "use": it changes the browser setting for
+   all sessions in the profile. Then open a new `browser_exec` session, select the
+   intended tab and inspect it. If you can't check it, tell me it's unverified. If
+   it is blank, on the wrong page or blocked, fix what you can and check again.
+3. If I'm on another device on Tailscale, pick the Tailscale link (prefer the HTTPS
+   MagicDNS link if configured). Check /healthz on that origin without opening the
+   one-time link. A 127.0.0.1 link works only on the host. If I can't connect, check
+   whether the device is on the same tailnet. Call action "link" for a fresh link:
+   each link works once and expires after 10 minutes.
+4. Send the checked link and wait while I log in. Never type my credentials or store
+   the link. When I say I'm done, inspect the same tab to confirm I'm signed in.
+5. Carry on in that same `browser_exec` session. If you changed the shared setting
+   for this handoff, call "use" with name "clear" when we are finished.
 
 Other actions: "status" and "list" show what is running, "new" starts another browser
 with its own profile (one per account), "stop" stops a browser (add what="server" to
@@ -136,7 +140,7 @@ hermes browser-viewer tls files --cert fullchain.pem --key key.pem --name viewer
 hermes browser-viewer tls off          # back to plain HTTP; `tls status` shows the current setting
 ```
 
-From a chat: the `browser_viewer` tool (actions `status`, `start`, `link`, `list`, `new`, `adopt`, `use`, `stop`, `rotate_token`) and the `/viewer` slash command. The agent starts a viewer, gives you the link, and after you have logged in switches `browser_exec` to that browser with `use`.
+From a chat: use the `browser_viewer` tool (actions `status`, `start`, `link`, `list`, `new`, `adopt`, `use`, `stop`, `rotate_token`) or the `/viewer` slash command. For a login handoff, follow the tab and link checks in [Instructions for agents](#instructions-for-agents).
 
 Open the link from the device you want to control the browser from. It works once and for 10 minutes: use `link` again for another device. The server listens on the addresses you choose with `BROWSER_VIEWER_HOSTS`, by default loopback plus the machine's Tailscale IPv4 if `tailscale` is installed. It never binds `0.0.0.0`. It shuts itself down after 60 minutes with no open window.
 
