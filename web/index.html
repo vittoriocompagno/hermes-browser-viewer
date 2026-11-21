@@ -122,7 +122,7 @@ body[data-conn=off] #info,body[data-conn=err] #info{background:var(--error-c);co
 #stage{container-type:size;display:grid;place-items:center;min-height:0;padding:0 16px 16px;overflow:hidden}
 #main{--ar:1.6;width:min(100cqw,100cqh * var(--ar));height:auto;max-height:100cqh;display:block;
   border-radius:14px;background:var(--surface-c);box-shadow:var(--shadow);outline:none;
-  touch-action:none;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;
+  touch-action:none;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;transform-origin:0 0;
   transition:opacity .3s var(--ease),filter .3s var(--ease)}
 body:not([data-conn=on]) #main{opacity:.4;filter:saturate(.3)}
 body[data-conn=wait] #main{opacity:1;filter:none;animation:breathe 1.6s ease-in-out infinite}
@@ -146,6 +146,13 @@ body[data-conn=out] #info svg.out{width:28px;height:28px;padding:14px;box-sizing
 body[data-conn=out] #url{white-space:normal;font-size:15px;line-height:1.5;text-wrap:pretty;color:var(--on-variant);flex:none;width:100%}
 
 #kb{position:fixed;left:0;bottom:0;width:1px;height:1px;opacity:0;border:0;padding:0;margin:0;resize:none;font-size:16px;pointer-events:none}
+#pastebox{position:fixed;z-index:6;left:50%;bottom:calc(84px + env(safe-area-inset-bottom));transform:translateX(-50%);
+  display:flex;gap:6px;width:min(420px,calc(100vw - 24px));padding:6px;border-radius:999px;background:var(--pill-bg);box-shadow:var(--shadow);
+  -webkit-backdrop-filter:blur(16px) saturate(1.4);backdrop-filter:blur(16px) saturate(1.4)}
+#pastebox[hidden]{display:none}
+#pastein{flex:1;min-width:0;height:44px;padding:0 16px;border:0;border-radius:999px;background:var(--surface-high);color:var(--on-surface);font:16px var(--font)}
+#pastein:focus-visible{outline:2px solid var(--primary);outline-offset:-2px}
+#pastego{background:var(--primary);color:var(--on-primary);height:44px}
 
 /* ---- phones: address next to the browser, tabs below, controls in a floating pill */
 @media (max-width:700px){
@@ -181,6 +188,7 @@ body[data-conn=out] #url{white-space:normal;font-size:15px;line-height:1.5;text-
   <symbol id="i-grid" viewBox="0 0 256 256"><path d="M104,40H56A16,16,0,0,0,40,56v48a16,16,0,0,0,16,16h48a16,16,0,0,0,16-16V56A16,16,0,0,0,104,40Zm0,64H56V56h48v48Zm96-64H152a16,16,0,0,0-16,16v48a16,16,0,0,0,16,16h48a16,16,0,0,0,16-16V56A16,16,0,0,0,200,40Zm0,64H152V56h48v48Zm-96,32H56a16,16,0,0,0-16,16v48a16,16,0,0,0,16,16h48a16,16,0,0,0,16-16V152A16,16,0,0,0,104,136Zm0,64H56V152h48v48Zm96-64H152a16,16,0,0,0-16,16v48a16,16,0,0,0,16,16h48a16,16,0,0,0,16-16V152A16,16,0,0,0,200,136Zm0,64H152V152h48v48Z"/></symbol>
   <symbol id="i-window" viewBox="0 0 256 256"><path d="M216,40H40A16,16,0,0,0,24,56V200a16,16,0,0,0,16,16H216a16,16,0,0,0,16-16V56A16,16,0,0,0,216,40Zm0,160H40V56H216V200ZM80,84A12,12,0,1,1,68,72,12,12,0,0,1,80,84Zm40,0a12,12,0,1,1-12-12A12,12,0,0,1,120,84Z"/></symbol>
   <symbol id="i-kbd" viewBox="0 0 256 256"><path d="M224,48H32A16,16,0,0,0,16,64V192a16,16,0,0,0,16,16H224a16,16,0,0,0,16-16V64A16,16,0,0,0,224,48Zm0,144H32V64H224V192Zm-16-64a8,8,0,0,1-8,8H56a8,8,0,0,1,0-16H200A8,8,0,0,1,208,128Zm0-32a8,8,0,0,1-8,8H56a8,8,0,0,1,0-16H200A8,8,0,0,1,208,96ZM72,160a8,8,0,0,1-8,8H56a8,8,0,0,1,0-16h8A8,8,0,0,1,72,160Zm96,0a8,8,0,0,1-8,8H96a8,8,0,0,1,0-16h64A8,8,0,0,1,168,160Zm40,0a8,8,0,0,1-8,8h-8a8,8,0,0,1,0-16h8A8,8,0,0,1,208,160Z"/></symbol>
+  <symbol id="i-paste" viewBox="0 0 256 256"><path d="M168,152a8,8,0,0,1-8,8H96a8,8,0,0,1,0-16h64A8,8,0,0,1,168,152Zm-8-40H96a8,8,0,0,0,0,16h64a8,8,0,0,0,0-16Zm56-64V216a16,16,0,0,1-16,16H56a16,16,0,0,1-16-16V48A16,16,0,0,1,56,32H92.26a47.92,47.92,0,0,1,71.48,0H200A16,16,0,0,1,216,48ZM96,64h64a32,32,0,0,0-64,0ZM200,48H173.25A47.93,47.93,0,0,1,176,64v8a8,8,0,0,1-8,8H88a8,8,0,0,1-8-8V64a47.93,47.93,0,0,1,2.75-16H56V216H200Z"/></symbol>
   <symbol id="i-gauge" viewBox="0 0 256 256"><path d="M207.06,72.67A111.24,111.24,0,0,0,128,40h-.4C66.07,40.21,16,91,16,153.13V176a16,16,0,0,0,16,16H224a16,16,0,0,0,16-16V152A111.25,111.25,0,0,0,207.06,72.67ZM224,176H119.71l54.76-75.3a8,8,0,0,0-12.94-9.42L99.92,176H32V153.13c0-3.08.15-6.12.43-9.13H56a8,8,0,0,0,0-16H35.27c10.32-38.86,44-68.24,84.73-71.66V80a8,8,0,0,0,16,0V56.33A96.14,96.14,0,0,1,221,128H200a8,8,0,0,0,0,16h23.67c.21,2.65.33,5.31.33,8Z"/></symbol>
   <symbol id="i-follow" viewBox="0 0 256 256"><path d="M128,24A104,104,0,1,0,232,128,104.11,104.11,0,0,0,128,24Zm8,191.63V184a8,8,0,0,0-16,0v31.63A88.13,88.13,0,0,1,40.37,136H72a8,8,0,0,0,0-16H40.37A88.13,88.13,0,0,1,120,40.37V72a8,8,0,0,0,16,0V40.37A88.13,88.13,0,0,1,215.63,120H184a8,8,0,0,0,0,16h31.63A88.13,88.13,0,0,1,136,215.63Z"/></symbol>
   <symbol id="i-lock" viewBox="0 0 256 256"><path d="M208,80H176V56a48,48,0,0,0-96,0V80H48A16,16,0,0,0,32,96V208a16,16,0,0,0,16,16H208a16,16,0,0,0,16-16V96A16,16,0,0,0,208,80ZM96,56a32,32,0,0,1,64,0V80H96ZM208,208H48V96H208V208Z"/></symbol>
@@ -200,6 +208,7 @@ body[data-conn=out] #url{white-space:normal;font-size:15px;line-height:1.5;text-
   <div id="ctl">
     <label class="btn tog" title="follow the tab the agent is working on"><input type="checkbox" id="follow" checked><svg class="i" aria-hidden="true"><use href="#i-follow"/></svg><span class="lbl">Follow</span></label>
     <button id="kbd" class="btn ic" title="keyboard" aria-label="keyboard" aria-pressed="false" hidden><svg class="i" aria-hidden="true"><use href="#i-kbd"/></svg></button>
+    <button id="paste" class="btn ic" title="paste" aria-label="paste" hidden><svg class="i" aria-hidden="true"><use href="#i-paste"/></svg></button>
     <button id="mosaic" class="btn" title="show all tabs" aria-pressed="false"><svg class="i many" aria-hidden="true"><use href="#i-grid"/></svg><svg class="i one" aria-hidden="true"><use href="#i-window"/></svg><span class="lbl">Mosaic</span></button>
     <span class="btn sel"><svg class="i lead" aria-hidden="true"><use href="#i-gauge"/></svg><select id="q" title="stream quality" aria-label="stream quality">
       <option value="auto">Auto</option><option value="high">High</option><option value="med">Medium</option><option value="low">Low</option>
@@ -209,6 +218,7 @@ body[data-conn=out] #url{white-space:normal;font-size:15px;line-height:1.5;text-
 </div>
 <div id="info" role="status"><svg class="i lock" aria-hidden="true"><use href="#i-lock"/></svg><svg class="i web" aria-hidden="true"><use href="#i-globe"/></svg><svg class="i spin" aria-hidden="true"><use href="#i-notch"/></svg><svg class="i off" aria-hidden="true"><use href="#i-nosignal"/></svg><svg class="i out" aria-hidden="true"><use href="#i-unlink"/></svg><svg class="i err" aria-hidden="true"><use href="#i-warn"/></svg><span id="url"></span></div>
 <textarea id="kb" rows="1" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" enterkeyhint="go" aria-hidden="true" tabindex="-1"></textarea>
+<form id="pastebox" hidden autocomplete="off"><input id="pastein" type="password" aria-label="paste" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="send"><button id="pastego" class="btn" type="submit">Send</button></form>
 <div id="stage"><canvas id="main" tabindex="0" width="640" height="400"></canvas><div id="grid" hidden></div></div>
 <script>
 const $ = id => document.getElementById(id);
@@ -267,6 +277,8 @@ function onMsg(m) {
     tabs.forEach(t => idx2tid[t.idx] = t.id);
     if (pin && !tabs.some(t => t.id === pin)) { pin = autoPin = null; $('follow').checked = true; sendView(); }
     renderTabs(); renderGrid(); showUrl();
+  } else if (m.t === 'focus') {
+    if (!m.editable && kbOn && m.tab === tab()) kbSet(false);
   } else if (m.t === 'err') {
     conn('err'); $('url').textContent = m.u;
     if (m.instances && m.instances.length > 1) INST = '';
@@ -372,24 +384,55 @@ main.addEventListener('mousemove', e => { const n = performance.now(); if (n - l
 main.addEventListener('wheel', e => { e.preventDefault(); const p = pos(e, true); send({t: 'mouse', tab: tab(), type: 'mouseWheel', ...p, deltaX: e.deltaX, deltaY: e.deltaY}); }, {passive: false});
 
 // ---- touch: a tap clicks, a one-finger drag scrolls the remote page
-let tp = null;
+// ---- touch: a tap clicks; one finger pans the zoomed view first and scrolls the page with what is left;
+// two fingers pinch-zoom and pan the view locally (the remote page keeps its size, only the picture is magnified).
+let tp = null, pz = null, zoom = 1, zx = 0, zy = 0;
+function zoomApply() {
+  const W = main.offsetWidth, H = main.offsetHeight;
+  zoom = Math.min(Math.max(zoom, 1), 6);
+  if (zoom < 1.02) { zoom = 1; zx = zy = 0; }
+  zx = Math.min(0, Math.max(W - W * zoom, zx)); zy = Math.min(0, Math.max(H - H * zoom, zy));
+  main.style.transform = zoom === 1 ? '' : `translate(${zx}px,${zy}px) scale(${zoom})`;
+}
+addEventListener('resize', zoomApply);
+const mid = e => ({x: (e.touches[0].clientX + e.touches[1].clientX) / 2, y: (e.touches[0].clientY + e.touches[1].clientY) / 2,
+  d: Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY) || 1});
 main.addEventListener('touchstart', e => {
   e.preventDefault();
   const t = e.touches[0];
-  tp = e.touches.length === 1 ? {x0: t.clientX, y0: t.clientY, x: t.clientX, y: t.clientY, moved: false} : null;
+  if (e.touches.length === 1 && !pz) { tp = {x0: t.clientX, y0: t.clientY, x: t.clientX, y: t.clientY, moved: false}; return; }
+  tp = null;
+  if (e.touches.length === 2) {
+    const m = mid(e), r = main.getBoundingClientRect(), left = r.left - zx, top = r.top - zy;
+    pz = {d0: m.d, z0: zoom, left, top, ux: (m.x - left - zx) / zoom, uy: (m.y - top - zy) / zoom};
+  }
 }, {passive: false});
 main.addEventListener('touchmove', e => {
   e.preventDefault();
-  if (!tp || e.touches.length !== 1) { tp = null; return; }
+  if (pz && e.touches.length === 2) {
+    const m = mid(e);
+    zoom = Math.min(Math.max(pz.z0 * m.d / pz.d0, 1), 6);
+    zx = m.x - pz.left - pz.ux * zoom; zy = m.y - pz.top - pz.uy * zoom;
+    zoomApply(); return;
+  }
+  if (!tp || e.touches.length !== 1) return;
   const t = e.touches[0];
   if (!tp.moved && Math.hypot(t.clientX - tp.x0, t.clientY - tp.y0) < 10) return;
   tp.moved = true;
-  const f = fit();
-  send({t: 'mouse', tab: tab(), type: 'mouseWheel', ...at(t.clientX, t.clientY, true), deltaX: -(t.clientX - tp.x) * cssW / f.w, deltaY: -(t.clientY - tp.y) * cssH / f.h});
+  let dx = t.clientX - tp.x, dy = t.clientY - tp.y;
+  if (zoom > 1) {
+    const ox = zx, oy = zy;
+    zx += dx; zy += dy; zoomApply();
+    dx -= zx - ox; dy -= zy - oy;
+  }
   tp.x = t.clientX; tp.y = t.clientY; touch();
+  if (Math.abs(dx) + Math.abs(dy) < 0.5) return;
+  const f = fit();
+  send({t: 'mouse', tab: tab(), type: 'mouseWheel', ...at(t.clientX, t.clientY, true), deltaX: -dx * cssW / f.w, deltaY: -dy * cssH / f.h});
 }, {passive: false});
 main.addEventListener('touchend', e => {
   e.preventDefault();
+  if (pz) { if (e.touches.length < 2) pz = null; return; }
   const t = tp; tp = null;
   if (!t || t.moved) return;
   const p = at(t.x0, t.y0);
@@ -398,9 +441,12 @@ main.addEventListener('touchend', e => {
     send({t: 'mouse', tab: tab(), type: 'mousePressed', ...p, button: 'left', buttons: 1, clickCount: 1});
     send({t: 'mouse', tab: tab(), type: 'mouseReleased', ...p, button: 'left', buttons: 0, clickCount: 1});
   }
-  if (kbOn) kb.focus({preventScroll: true});     // inside the gesture, so the soft keyboard stays up
+  if (kbOn) {
+    kb.focus({preventScroll: true});              // inside the gesture, so the soft keyboard stays up
+    setTimeout(() => send({t: 'focus', tab: tab()}), 150);   // and it goes down if the tap did not land on a text field
+  }
 }, {passive: false});
-main.addEventListener('touchcancel', () => { tp = null; });
+main.addEventListener('touchcancel', () => { tp = null; pz = null; });
 main.addEventListener('contextmenu', e => e.preventDefault());
 const SP = {Enter: 13, Backspace: 8, Tab: 9, Escape: 27, ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40, Delete: 46, Home: 36, End: 35, PageUp: 33, PageDown: 34};
 const typing = e => mode === 'single' && !['SELECT', 'INPUT', 'BUTTON', 'TEXTAREA'].includes(e.target.tagName);
@@ -408,7 +454,7 @@ const typing = e => mode === 'single' && !['SELECT', 'INPUT', 'BUTTON', 'TEXTARE
 // Android keyboards send key 'Unidentified' for letters, so keydown is useless there: the textarea content is diffed instead.
 const kb = $('kb'), SENT = '    ';        // sentinel spaces, so Backspace on an empty box still produces an input event
 let kbOn = false, composing = false, kbPrev = SENT;
-if (matchMedia('(pointer: coarse)').matches) $('kbd').hidden = false;
+if (matchMedia('(pointer: coarse)').matches) $('kbd').hidden = $('paste').hidden = false;
 function kbReset() { kb.value = kbPrev = SENT; kb.setSelectionRange(SENT.length, SENT.length); }
 function pressKey(key, vk, code, text) {
   send({t: 'key', tab: tab(), type: 'keyDown', key, code, vk, text: text || ''});
@@ -428,10 +474,11 @@ kb.addEventListener('input', kbSync);
 kb.addEventListener('compositionstart', () => { composing = true; });
 kb.addEventListener('compositionend', () => { composing = false; kbSync(); });
 kb.addEventListener('keydown', e => { if (e.key in SP) { e.preventDefault(); touch(); pressKey(e.key, SP[e.key], e.code, e.key === 'Enter' ? '\r' : ''); } });
-$('kbd').onclick = () => {
-  kbOn = !kbOn; $('kbd').classList.toggle('on', kbOn); $('kbd').setAttribute('aria-pressed', kbOn);
+function kbSet(on) {
+  kbOn = on; $('kbd').classList.toggle('on', kbOn); $('kbd').setAttribute('aria-pressed', kbOn);
   if (kbOn) { kbReset(); kb.focus({preventScroll: true}); } else kb.blur();
-};
+}
+$('kbd').onclick = () => kbSet(!kbOn);
 document.addEventListener('keydown', e => {
   if (!typing(e)) return;
   touch();
@@ -443,6 +490,20 @@ document.addEventListener('keyup', e => {
   if (!typing(e) || chord(e)) return;
   if (e.key in SP || e.key.length === 1) { e.preventDefault(); send({t: 'key', tab: tab(), type: 'keyUp', key: e.key, code: e.code, vk: SP[e.key] || e.keyCode, mod: mods(e)}); }
 });
+// ---- paste on phones: the canvas has no long-press menu, so the button reads the clipboard,
+// or opens a masked field where the OS paste menu works (iOS WebViews often refuse clipboard.readText).
+const pbox = $('pastebox'), pasteIn = $('pastein');
+function pasteSend(t) { if (t) { touch(); send({t: 'text', tab: tab(), text: t}); } }
+function pasteClose() { pasteIn.value = ''; pbox.hidden = true; $('paste').setAttribute('aria-expanded', 'false'); }
+function pasteOpen() { pbox.hidden = false; $('paste').setAttribute('aria-expanded', 'true'); pasteIn.focus(); }
+$('paste').onclick = async () => {
+  if (!pbox.hidden) { pasteClose(); return; }
+  let t = '';
+  try { if (navigator.clipboard && navigator.clipboard.readText) t = await navigator.clipboard.readText(); } catch (_) {}
+  if (t) pasteSend(t); else pasteOpen();
+};
+pbox.addEventListener('submit', e => { e.preventDefault(); pasteSend(pasteIn.value); pasteClose(); });
+pasteIn.addEventListener('keydown', e => { if (e.key === 'Escape') pasteClose(); });
 document.addEventListener('paste', e => {
   if (!typing(e)) return;
   const t = (e.clipboardData || window.clipboardData).getData('text');

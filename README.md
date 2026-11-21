@@ -1,6 +1,6 @@
 <p align="center">
   <img alt="Hermes 0.23.1 or newer" src="https://img.shields.io/badge/Hermes-%E2%89%A5%200.23.1-1a73e8?style=flat-square">
-  <img alt="plugin version 0.1.0" src="https://img.shields.io/badge/plugin-0.1.0-0a84ff?style=flat-square">
+  <img alt="plugin version 0.3.5" src="https://img.shields.io/badge/plugin-0.3.5-0a84ff?style=flat-square">
   <img alt="Linux | macOS" src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS-34c759?style=flat-square">
   <img alt="MIT license" src="https://img.shields.io/badge/license-MIT-8e8e93?style=flat-square">
 </p>
@@ -43,18 +43,22 @@ Setup, once:
 
 Whenever you need me to log in:
 1. Call browser_viewer with action "start" (browser name "login" unless I say
-   otherwise). It returns the login link.
-2. Send me the link. It works once and expires after 10 minutes; call action "link"
-   for a fresh one, for example for another device. If the only link is on 127.0.0.1,
-   it opens on this machine only: tell me.
-3. Wait while I log in on that page. Never type my password, my 2FA code or any other
-   credential yourself, and never write the link into files, notes or memory.
-4. When I say I am done, take a screenshot and check that the page shows the logged-in
-   state.
-5. If I want you to keep working in that browser with browser_exec, call action "use"
-   with name "login", then open a NEW browser_exec session. "use" sets browser.cdp_url
-   for every Hermes session, cron jobs included, so do it only because I asked or
-   agreed. When we are finished, call "use" with name "clear".
+   otherwise). Pass the intended page as `url` when creating the browser.
+2. Use action "list" to find that browser's CDP endpoint. Only take the screenshot
+   with `browser_exec` after confirming it is attached to that endpoint. If it
+   isn't attached, ask me before calling "use": it changes the browser setting for
+   all sessions in the profile. Then open a new `browser_exec` session, select the
+   intended tab and inspect it. If you can't check it, tell me it's unverified. If
+   it is blank, on the wrong page or blocked, fix what you can and check again.
+3. If I'm on another device on Tailscale, pick the Tailscale link (prefer the HTTPS
+   MagicDNS link if configured). Check /healthz on that origin without opening the
+   one-time link. A 127.0.0.1 link works only on the host. If I can't connect, check
+   whether the device is on the same tailnet. Call action "link" for a fresh link:
+   each link works once and expires after 10 minutes.
+4. Send the checked link and wait while I log in. Never type my credentials or store
+   the link. When I say I'm done, inspect the same tab to confirm I'm signed in.
+5. Carry on in that same `browser_exec` session. If you changed the shared setting
+   for this handoff, call "use" with name "clear" when we are finished.
 
 Other actions: "status" and "list" show what is running, "new" starts another browser
 with its own profile (one per account), "stop" stops a browser (add what="server" to
@@ -92,7 +96,7 @@ The agent asks for a link, you open it, you log in, and the agent keeps working 
 - Several windows and several browsers at once, each browser with its own persistent profile, for example one per account.
 - A follow mode: the page follows the tab the agent works on and pins to the tab you are using while you type.
 - Stream quality that adapts to each client's round-trip time, or a level you fix yourself.
-- Mouse, keyboard (AltGr included), drag and paste, plus touch: a tap clicks, one finger scrolls, and a keyboard button opens the phone keyboard.
+- Mouse, keyboard (AltGr included), drag and paste, plus touch: a tap clicks, one finger scrolls, two fingers pinch-zoom the picture, a keyboard button opens the phone keyboard (it closes again after a tap that does not land on a text field) and a paste button sends the clipboard, or opens a masked field where the phone's own paste menu works.
 - Single-use login links and an `HttpOnly` session cookie. No keystroke, pasted text or secret is written to any log.
 
 ## At a glance
@@ -100,7 +104,7 @@ The agent asks for a link, you open it, you log in, and the agent keeps working 
 | Item | Details |
 |---|---|
 | Hermes | 0.23.1 or newer (developed and tested on v0.23.1) |
-| Plugin | 0.3.4, MIT |
+| Plugin | 0.3.5, MIT |
 | System | Linux, tested on Arch-based Omarchy, x86_64 (process checks read `/proc`). macOS on Apple Silicon, tested on GitHub's macOS runners (process checks through `psutil`, which Hermes already ships) |
 | Browser | Chromium or Chrome, tested with Chromium 155 |
 | Viewing device | any current browser, touch supported |
@@ -136,7 +140,7 @@ hermes browser-viewer tls files --cert fullchain.pem --key key.pem --name viewer
 hermes browser-viewer tls off          # back to plain HTTP; `tls status` shows the current setting
 ```
 
-From a chat: the `browser_viewer` tool (actions `status`, `start`, `link`, `list`, `new`, `adopt`, `use`, `stop`, `rotate_token`) and the `/viewer` slash command. The agent starts a viewer, gives you the link, and after you have logged in switches `browser_exec` to that browser with `use`.
+From a chat: use the `browser_viewer` tool (actions `status`, `start`, `link`, `list`, `new`, `adopt`, `use`, `stop`, `rotate_token`) or the `/viewer` slash command. For a login handoff, follow the tab and link checks in [Instructions for agents](#instructions-for-agents).
 
 Open the link from the device you want to control the browser from. It works once and for 10 minutes: use `link` again for another device. The server listens on the addresses you choose with `BROWSER_VIEWER_HOSTS`, by default loopback plus the machine's Tailscale IPv4 if `tailscale` is installed. It never binds `0.0.0.0`. It shuts itself down after 60 minutes with no open window.
 
@@ -210,7 +214,7 @@ What you should know before installing:
 - HTTPS is opt-in, and the certificate is only refreshed when the server starts: a server kept running past the certificate's expiry keeps serving the old one (it exits after 60 idle minutes by default). If Tailscale cannot be reached at start, the certificate on disk is reused with a warning as long as it has not expired; the server never falls back to plain HTTP on a TLS address.
 - No per-device session list: a session lasts until it expires or the master secret is rotated, and rotating signs every browser out.
 - Frame rate and bandwidth were measured on loopback with simulated delay, not on real WAN links.
-- On a phone in portrait the remote page (1280 px wide) is scaled to about a third, so fields are small. Landscape is much more comfortable.
+- On a phone in portrait the remote page (1280 px wide) is scaled to about a third, so fields are small. Pinch to zoom in, or turn the phone to landscape.
 - The tool handler is synchronous: a cold start can block for up to about 75 seconds (15 s for Chromium plus up to 60 s for the server), more if `hermes config` is slow (30 s) or `tls tailscale` has to ask Tailscale for a certificate (up to 130 s).
 - Cookies are not scoped by port: on the same host name another service on a different port receives the viewer's cookie. Its name carries the port and the value is signed and `HttpOnly`, so it is useless to that service, but it is sent.
 - After the 0.8 s quiet window, keystrokes go to the tab the agent opened. A click is not required first.

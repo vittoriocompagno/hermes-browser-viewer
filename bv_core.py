@@ -467,7 +467,8 @@ def _start_ua_attacher(cdp: str, exe: str, url: Optional[str]) -> Dict[str, Any]
             "userAgent": headless_user_agent(exe),
             "acceptLanguage": _weighted_accept_lang() if is_headless_shell(exe) else None}) + "\n")
         proc.stdin.close()
-        readable, _, _ = select.select([proc.stdout], [], [], START_TIMEOUT)
+        # a little longer than the attacher's own socket timeout, so a stuck call is logged in ua.log before the kill
+        readable, _, _ = select.select([proc.stdout], [], [], START_TIMEOUT + 5)
         if not readable or proc.stdout.readline().strip() != "ready":
             raise ViewerError("client-hint attacher did not start: see ua.log")
         return {"ua_pid": proc.pid, "ua_starttime": _proc_start(proc.pid)}
