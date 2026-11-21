@@ -528,6 +528,36 @@ class ViewerTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await b.close_tab(tid)
 
+    async def test_paste_button_falls_back_to_a_masked_field_that_reaches_the_page(self):
+        import bv_server
+        (link,) = bv_core.links("t1")
+        async with Cdp(self.inst["cdp"]) as page, Cdp(self.inst2["cdp"]) as dev:
+            form = await page.new_tab(FORM)
+            vid = await dev.new_tab(link)
+            try:
+                await page.evaluate(form, "document.getElementById('f').focus()")
+                ok = lambda: dev.evaluate(vid, "document.getElementById('st').classList.contains('on')")
+                for _ in range(80):
+                    if await ok():
+                        break
+                    await asyncio.sleep(0.15)
+                self.assertTrue(await ok(), "the stream never connected")
+                await asyncio.sleep(bv_server.INPUT_QUIET + 0.4)   # input right after the tab appears is dropped on purpose
+                await page.evaluate(form, "document.getElementById('f').focus()")
+                # headless has no clipboard permission, so the button must open the masked field instead
+                await dev.evaluate(vid, "(() => { const b = document.getElementById('paste'); b.hidden = false; b.click(); })()")
+                await asyncio.sleep(0.5)
+                self.assertFalse(await dev.evaluate(vid, "document.getElementById('pastebox').hidden"), "the paste field did not open")
+                self.assertEqual(await dev.evaluate(vid, "document.getElementById('pastein').type"), "password")
+                await dev.evaluate(vid, "(() => { document.getElementById('pastein').value = 'S3cret!x'; document.getElementById('pastego').click(); })()")
+                await asyncio.sleep(0.6)
+                self.assertEqual(await page.evaluate(form, "document.getElementById('f').value"), "S3cret!x")
+                self.assertTrue(await dev.evaluate(vid, "document.getElementById('pastebox').hidden"), "the field must close after sending")
+                self.assertEqual(await dev.evaluate(vid, "document.getElementById('pastein').value"), "", "the pasted text must not stay in the field")
+            finally:
+                await dev.close_tab(vid)
+                await page.close_tab(form)
+
     async def test_every_screencast_ack_that_is_owed_is_sent_on_release(self):
         import bv_server
         hub = bv_server.Hub("x", "http://127.0.0.1:1")
