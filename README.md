@@ -96,7 +96,7 @@ The agent asks for a link, you open it, you log in, and the agent keeps working 
 - Several windows and several browsers at once, each browser with its own persistent profile, for example one per account.
 - A follow mode: the page follows the tab the agent works on and pins to the tab you are using while you type.
 - Stream quality that adapts to each client's round-trip time, or a level you fix yourself.
-- Mouse, keyboard (AltGr included), drag and paste, plus touch: a tap clicks, one finger scrolls, and a keyboard button opens the phone keyboard.
+- Mouse, keyboard (AltGr included), drag and paste, plus touch: a tap clicks, one finger scrolls, two fingers pinch-zoom the picture, a keyboard button opens the phone keyboard (it closes again after a tap that does not land on a text field) and a paste button sends the clipboard, or opens a masked field where the phone's own paste menu works.
 - Single-use login links and an `HttpOnly` session cookie. No keystroke, pasted text or secret is written to any log.
 
 ## At a glance
@@ -214,7 +214,7 @@ What you should know before installing:
 - HTTPS is opt-in, and the certificate is only refreshed when the server starts: a server kept running past the certificate's expiry keeps serving the old one (it exits after 60 idle minutes by default). If Tailscale cannot be reached at start, the certificate on disk is reused with a warning as long as it has not expired; the server never falls back to plain HTTP on a TLS address.
 - No per-device session list: a session lasts until it expires or the master secret is rotated, and rotating signs every browser out.
 - Frame rate and bandwidth were measured on loopback with simulated delay, not on real WAN links.
-- On a phone in portrait the remote page (1280 px wide) is scaled to about a third, so fields are small. Landscape is much more comfortable.
+- On a phone in portrait the remote page (1280 px wide) is scaled to about a third, so fields are small. Pinch to zoom in, or turn the phone to landscape.
 - The tool handler is synchronous: a cold start can block for up to about 75 seconds (15 s for Chromium plus up to 60 s for the server), more if `hermes config` is slow (30 s) or `tls tailscale` has to ask Tailscale for a certificate (up to 130 s).
 - Cookies are not scoped by port: on the same host name another service on a different port receives the viewer's cookie. Its name carries the port and the value is signed and `HttpOnly`, so it is useless to that service, but it is sent.
 - After the 0.8 s quiet window, keystrokes go to the tab the agent opened. A click is not required first.
