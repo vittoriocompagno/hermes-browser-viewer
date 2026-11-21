@@ -24,6 +24,7 @@ import base64
 import json
 import os
 import platform
+import select
 import socket
 import struct
 import sys
@@ -32,6 +33,7 @@ from urllib.parse import urlsplit
 
 INIT_TIMEOUT = 10.0     # seconds for every step of the set-up, unless the parent passes a longer one
 MAX_LOG_LINES = 200     # ua.log must not grow with the number of requests
+RELEASE_AFTER = 3.0     # a target whose override is not confirmed by then is released anyway: no page stays paused
 # the order Chromium writes the client hints of a navigation in (the order of its own list of hints)
 HINT_ORDER = ("sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-full-version", "sec-ch-ua-arch", "sec-ch-ua-platform",
               "sec-ch-ua-platform-version", "sec-ch-ua-model", "sec-ch-ua-bitness", "sec-ch-ua-wow64",
@@ -143,6 +145,7 @@ class Attacher:
         self.native_hint = ""
         self.logged = 0
         self.waiting = None         # the set-up command being waited for, named in the log if the browser never answers
+        self.held = {}              # sessionId -> (attached at, type, release, done) of the targets still paused by us
 
     def log(self, text: str) -> None:
         self.logged += 1
@@ -160,6 +163,10 @@ class Attacher:
         return self.mid
 
     def step(self) -> None:
+        if self.held:
+            self.sweep()
+            if not self.ws.buf and not select.select([self.ws.sock], [], [], 0.5)[0]:
+                return          # nothing to read: come back to check the held targets again
         d = json.loads(self.ws.recv())
         if "id" in d:
             then = self.pending.pop(d["id"], None)
@@ -175,6 +182,8 @@ class Attacher:
             elif method == "Target.detachedFromTarget":
                 sid = d["params"]["sessionId"]
                 self.pages = {t: s for t, s in self.pages.items() if s != sid}
+                if sid in self.held:
+                    self.held[sid][3]()         # gone before it was released: nothing left to wait for
         except (KeyError, TypeError, ValueError) as exc:        # one odd event must not end the override of all tabs
             self.log(f"{d.get('method')}: {type(exc).__name__}: {exc}")
 
@@ -191,21 +200,37 @@ class Attacher:
         return box[0].get("result", {})
 
     # ------------------------------------------------------------------ targets
+    def sweep(self) -> None:
+        """Release the targets whose set-up never got an answer (seen on CI: one target, and the start never ended)."""
+        now = time.monotonic()
+        for sid, (since, kind, release, done) in list(self.held.items()):
+            if now - since > RELEASE_AFTER:
+                self.log(f"released a {kind} target after {RELEASE_AFTER:.0f} s without an answer from the browser")
+                release()
+                done()
+
     def attached(self, params) -> None:
         sid, info = params["sessionId"], params["targetInfo"]
         kind = info.get("type")
         self.busy += 1
+        state = {"released": False}
+
+        def done(_r=None):
+            if self.held.pop(sid, None) is not None:
+                self.busy -= 1
 
         def release(_reply=None):
+            if state["released"]:
+                return          # already released (by the sweep, or a late answer after it)
+            state["released"] = True
             # auto-attach is not recursive: each tab, page, frame and worker has to watch its own children.
             # The target is released whatever happened: a page must never stay paused because of us
-            def watched(_r):
-                self.busy -= 1
-            self.send("Target.setAutoAttach", sid, then=watched, autoAttach=True, waitForDebuggerOnStart=True, flatten=True)
+            self.send("Target.setAutoAttach", sid, then=done, autoAttach=True, waitForDebuggerOnStart=True, flatten=True)
             self.send("Runtime.runIfWaitingForDebugger", sid)
             if kind == "page":
                 self.pages[info["targetId"]] = sid
 
+        self.held[sid] = (time.monotonic(), kind, release, done)
         if kind == "tab":
             return release()
 
