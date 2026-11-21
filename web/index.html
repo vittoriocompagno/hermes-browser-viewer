@@ -122,7 +122,7 @@ body[data-conn=off] #info,body[data-conn=err] #info{background:var(--error-c);co
 #stage{container-type:size;display:grid;place-items:center;min-height:0;padding:0 16px 16px;overflow:hidden}
 #main{--ar:1.6;width:min(100cqw,100cqh * var(--ar));height:auto;max-height:100cqh;display:block;
   border-radius:14px;background:var(--surface-c);box-shadow:var(--shadow);outline:none;
-  touch-action:none;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;
+  touch-action:none;-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent;transform-origin:0 0;
   transition:opacity .3s var(--ease),filter .3s var(--ease)}
 body:not([data-conn=on]) #main{opacity:.4;filter:saturate(.3)}
 body[data-conn=wait] #main{opacity:1;filter:none;animation:breathe 1.6s ease-in-out infinite}
@@ -277,6 +277,8 @@ function onMsg(m) {
     tabs.forEach(t => idx2tid[t.idx] = t.id);
     if (pin && !tabs.some(t => t.id === pin)) { pin = autoPin = null; $('follow').checked = true; sendView(); }
     renderTabs(); renderGrid(); showUrl();
+  } else if (m.t === 'focus') {
+    if (!m.editable && kbOn && m.tab === tab()) kbSet(false);
   } else if (m.t === 'err') {
     conn('err'); $('url').textContent = m.u;
     if (m.instances && m.instances.length > 1) INST = '';
@@ -382,24 +384,55 @@ main.addEventListener('mousemove', e => { const n = performance.now(); if (n - l
 main.addEventListener('wheel', e => { e.preventDefault(); const p = pos(e, true); send({t: 'mouse', tab: tab(), type: 'mouseWheel', ...p, deltaX: e.deltaX, deltaY: e.deltaY}); }, {passive: false});
 
 // ---- touch: a tap clicks, a one-finger drag scrolls the remote page
-let tp = null;
+// ---- touch: a tap clicks; one finger pans the zoomed view first and scrolls the page with what is left;
+// two fingers pinch-zoom and pan the view locally (the remote page keeps its size, only the picture is magnified).
+let tp = null, pz = null, zoom = 1, zx = 0, zy = 0;
+function zoomApply() {
+  const W = main.offsetWidth, H = main.offsetHeight;
+  zoom = Math.min(Math.max(zoom, 1), 6);
+  if (zoom < 1.02) { zoom = 1; zx = zy = 0; }
+  zx = Math.min(0, Math.max(W - W * zoom, zx)); zy = Math.min(0, Math.max(H - H * zoom, zy));
+  main.style.transform = zoom === 1 ? '' : `translate(${zx}px,${zy}px) scale(${zoom})`;
+}
+addEventListener('resize', zoomApply);
+const mid = e => ({x: (e.touches[0].clientX + e.touches[1].clientX) / 2, y: (e.touches[0].clientY + e.touches[1].clientY) / 2,
+  d: Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY) || 1});
 main.addEventListener('touchstart', e => {
   e.preventDefault();
   const t = e.touches[0];
-  tp = e.touches.length === 1 ? {x0: t.clientX, y0: t.clientY, x: t.clientX, y: t.clientY, moved: false} : null;
+  if (e.touches.length === 1 && !pz) { tp = {x0: t.clientX, y0: t.clientY, x: t.clientX, y: t.clientY, moved: false}; return; }
+  tp = null;
+  if (e.touches.length === 2) {
+    const m = mid(e), r = main.getBoundingClientRect(), left = r.left - zx, top = r.top - zy;
+    pz = {d0: m.d, z0: zoom, left, top, ux: (m.x - left - zx) / zoom, uy: (m.y - top - zy) / zoom};
+  }
 }, {passive: false});
 main.addEventListener('touchmove', e => {
   e.preventDefault();
-  if (!tp || e.touches.length !== 1) { tp = null; return; }
+  if (pz && e.touches.length === 2) {
+    const m = mid(e);
+    zoom = Math.min(Math.max(pz.z0 * m.d / pz.d0, 1), 6);
+    zx = m.x - pz.left - pz.ux * zoom; zy = m.y - pz.top - pz.uy * zoom;
+    zoomApply(); return;
+  }
+  if (!tp || e.touches.length !== 1) return;
   const t = e.touches[0];
   if (!tp.moved && Math.hypot(t.clientX - tp.x0, t.clientY - tp.y0) < 10) return;
   tp.moved = true;
-  const f = fit();
-  send({t: 'mouse', tab: tab(), type: 'mouseWheel', ...at(t.clientX, t.clientY, true), deltaX: -(t.clientX - tp.x) * cssW / f.w, deltaY: -(t.clientY - tp.y) * cssH / f.h});
+  let dx = t.clientX - tp.x, dy = t.clientY - tp.y;
+  if (zoom > 1) {
+    const ox = zx, oy = zy;
+    zx += dx; zy += dy; zoomApply();
+    dx -= zx - ox; dy -= zy - oy;
+  }
   tp.x = t.clientX; tp.y = t.clientY; touch();
+  if (Math.abs(dx) + Math.abs(dy) < 0.5) return;
+  const f = fit();
+  send({t: 'mouse', tab: tab(), type: 'mouseWheel', ...at(t.clientX, t.clientY, true), deltaX: -dx * cssW / f.w, deltaY: -dy * cssH / f.h});
 }, {passive: false});
 main.addEventListener('touchend', e => {
   e.preventDefault();
+  if (pz) { if (e.touches.length < 2) pz = null; return; }
   const t = tp; tp = null;
   if (!t || t.moved) return;
   const p = at(t.x0, t.y0);
@@ -408,9 +441,12 @@ main.addEventListener('touchend', e => {
     send({t: 'mouse', tab: tab(), type: 'mousePressed', ...p, button: 'left', buttons: 1, clickCount: 1});
     send({t: 'mouse', tab: tab(), type: 'mouseReleased', ...p, button: 'left', buttons: 0, clickCount: 1});
   }
-  if (kbOn) kb.focus({preventScroll: true});     // inside the gesture, so the soft keyboard stays up
+  if (kbOn) {
+    kb.focus({preventScroll: true});              // inside the gesture, so the soft keyboard stays up
+    setTimeout(() => send({t: 'focus', tab: tab()}), 150);   // and it goes down if the tap did not land on a text field
+  }
 }, {passive: false});
-main.addEventListener('touchcancel', () => { tp = null; });
+main.addEventListener('touchcancel', () => { tp = null; pz = null; });
 main.addEventListener('contextmenu', e => e.preventDefault());
 const SP = {Enter: 13, Backspace: 8, Tab: 9, Escape: 27, ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40, Delete: 46, Home: 36, End: 35, PageUp: 33, PageDown: 34};
 const typing = e => mode === 'single' && !['SELECT', 'INPUT', 'BUTTON', 'TEXTAREA'].includes(e.target.tagName);
@@ -438,10 +474,11 @@ kb.addEventListener('input', kbSync);
 kb.addEventListener('compositionstart', () => { composing = true; });
 kb.addEventListener('compositionend', () => { composing = false; kbSync(); });
 kb.addEventListener('keydown', e => { if (e.key in SP) { e.preventDefault(); touch(); pressKey(e.key, SP[e.key], e.code, e.key === 'Enter' ? '\r' : ''); } });
-$('kbd').onclick = () => {
-  kbOn = !kbOn; $('kbd').classList.toggle('on', kbOn); $('kbd').setAttribute('aria-pressed', kbOn);
+function kbSet(on) {
+  kbOn = on; $('kbd').classList.toggle('on', kbOn); $('kbd').setAttribute('aria-pressed', kbOn);
   if (kbOn) { kbReset(); kb.focus({preventScroll: true}); } else kb.blur();
-};
+}
+$('kbd').onclick = () => kbSet(!kbOn);
 document.addEventListener('keydown', e => {
   if (!typing(e)) return;
   touch();

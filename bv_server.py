@@ -65,6 +65,11 @@ MOSAIC_MAX = 12
 MAX_CLIENTS_PER_HUB = 16
 ACTIVE_DWELL = 1.0      # follow mode does not switch tabs more often than this
 INPUT_QUIET = 0.8       # input is dropped this long after the tab a window shows changed by itself
+FOCUS_JS = ("(() => { let e = document.activeElement;"
+            " while (e && e.shadowRoot && e.shadowRoot.activeElement) e = e.shadowRoot.activeElement;"
+            " if (!e) return false;"
+            " if (e.isContentEditable || e.tagName === 'TEXTAREA' || e.tagName === 'IFRAME') return true;"
+            " return e.tagName === 'INPUT' && !/^(button|submit|reset|checkbox|radio|range|color|file|image|hidden)$/i.test(e.type); })()")
 HDR = struct.Struct(">BHHHH")   # kind, tab idx, css width, css height, frame id
 
 
@@ -642,6 +647,16 @@ class Hub:
             await self.fire("Input.insertText", sid, text=m["text"][:2000])
         elif t == "reload":
             await self.fire("Page.reload", sid)
+        elif t == "focus":
+            asyncio.create_task(self._report_focus(c, tid, sid))
+
+    async def _report_focus(self, c: "Client", tid: str, sid: str) -> None:
+        """Tell a phone whether the tap left a text field focused, so it can drop the soft keyboard when it did not."""
+        try:
+            r = await self.call("Runtime.evaluate", sid, expression=FOCUS_JS, returnByValue=True)
+        except Exception:
+            return
+        await c.send_json({"t": "focus", "tab": tid, "editable": bool(r.get("result", {}).get("value"))})
 
     def stats(self) -> Dict[str, Any]:
         return {
@@ -872,7 +887,7 @@ async def ws_handler(request: web.Request) -> web.StreamResponse:
                 client.note_main(False)
                 hub.replay(client)
                 hub.dirty.set()
-            elif t in ("mouse", "key", "text", "reload"):
+            elif t in ("mouse", "key", "text", "reload", "focus"):
                 await hub.handle_input(client, m)
     finally:
         hub.clients.discard(client)

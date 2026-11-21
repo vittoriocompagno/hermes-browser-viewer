@@ -558,6 +558,54 @@ class ViewerTests(unittest.IsolatedAsyncioTestCase):
                 await dev.close_tab(vid)
                 await page.close_tab(form)
 
+    async def test_phone_pinch_zooms_locally_and_a_tap_off_a_text_field_drops_the_keyboard(self):
+        import bv_server
+        (link,) = bv_core.links("t1")
+        async with Cdp(self.inst["cdp"]) as page, Cdp(self.inst2["cdp"]) as dev:
+            form = await page.new_tab(FORM)
+            vid = await dev.new_tab(link)
+            sid = (await dev.call("Target.attachToTarget", targetId=vid, flatten=True))["sessionId"]
+            try:
+                await dev.call("Emulation.setTouchEmulationEnabled", sid, enabled=True, maxTouchPoints=5)
+                ev = lambda x: dev.call("Runtime.evaluate", sid, expression=x, returnByValue=True)
+                async def v(x):
+                    return (await ev(x))["result"].get("value")
+                for _ in range(80):
+                    if await v("document.getElementById('st').classList.contains('on') && document.getElementById('main').width > 0"):
+                        break
+                    await asyncio.sleep(0.15)
+                await asyncio.sleep(bv_server.INPUT_QUIET + 0.4)
+                r = await v("(() => { const r = document.getElementById('main').getBoundingClientRect(); return [r.left, r.top, r.width, r.height]; })()")
+                cx, cy = r[0] + r[2] / 2, r[1] + r[3] / 2
+                touch = lambda typ, pts: dev.call("Input.dispatchTouchEvent", sid, type=typ, touchPoints=[{"x": x, "y": y, "id": i} for i, (x, y) in enumerate(pts)])
+                await touch("touchStart", [(cx - 20, cy), (cx + 20, cy)])
+                for k in range(1, 6):
+                    await touch("touchMove", [(cx - 20 - 12 * k, cy), (cx + 20 + 12 * k, cy)])
+                await touch("touchEnd", [])
+                tf = await v("document.getElementById('main').style.transform")
+                self.assertIn("scale(", tf, "a pinch must magnify the view")
+                scale = float(tf.split("scale(")[1].rstrip(")"))
+                self.assertGreater(scale, 2.5)
+                self.assertEqual(await page.evaluate(form, "document.activeElement === document.body"), True, "a pinch must not click the page")
+                # keyboard on, then tap the coloured box (not a text field): the keyboard must go down
+                await v("(() => { const k = document.getElementById('kbd'); k.hidden = false; k.click(); })()")
+                self.assertTrue(await v("document.activeElement.id === 'kb'"))
+                await v("(() => { const m = document.getElementById('main'); m.style.transform = ''; })()")
+                await v("zoom = 1, zx = 0, zy = 0")
+                bx, by = r[0] + r[2] * (1 - 50 / 1280), r[1] + r[3] * (50 / 800)
+                await touch("touchStart", [(bx, by)])
+                await touch("touchEnd", [])
+                ok = False
+                for _ in range(30):
+                    if await v("document.getElementById('kbd').getAttribute('aria-pressed') === 'false' && document.activeElement.id !== 'kb'"):
+                        ok = True
+                        break
+                    await asyncio.sleep(0.1)
+                self.assertTrue(ok, "a tap that does not land on a text field must drop the soft keyboard")
+            finally:
+                await dev.close_tab(vid)
+                await page.close_tab(form)
+
     async def test_every_screencast_ack_that_is_owed_is_sent_on_release(self):
         import bv_server
         hub = bv_server.Hub("x", "http://127.0.0.1:1")
@@ -706,6 +754,26 @@ class ViewerTests(unittest.IsolatedAsyncioTestCase):
                     await v.send(t="key", tab=tid, type="keyDown", key="Backspace", code="Backspace", vk=8)
                     await asyncio.sleep(0.3)
                     self.assertEqual(await b.evaluate(tid, "document.getElementById('f').value"), "")
+            finally:
+                await b.close_tab(tid)
+
+    async def test_focus_query_reports_whether_a_text_field_has_focus(self):
+        async with Cdp(self.inst["cdp"]) as b:
+            tid = await b.new_tab(FORM)
+            try:
+                async with Viewer("t1") as v:
+                    self.assertTrue(await until(lambda: v.active == tid and v.count(v.idx_of(tid)) > 1, 8))
+                    import bv_server
+                    await asyncio.sleep(bv_server.INPUT_QUIET + 0.2)
+                    answers = lambda: [m for m in v.msgs if m.get("t") == "focus"]
+                    await b.evaluate(tid, "document.activeElement && document.activeElement.blur()")
+                    await v.send(t="focus", tab=tid)
+                    self.assertTrue(await until(lambda: len(answers()) == 1, 5), "no answer to the focus query")
+                    self.assertEqual(answers()[0], {"t": "focus", "tab": tid, "editable": False})
+                    await b.evaluate(tid, "document.getElementById('f').focus()")
+                    await v.send(t="focus", tab=tid)
+                    self.assertTrue(await until(lambda: len(answers()) == 2, 5))
+                    self.assertTrue(answers()[1]["editable"], "a focused input must keep the keyboard up")
             finally:
                 await b.close_tab(tid)
 
