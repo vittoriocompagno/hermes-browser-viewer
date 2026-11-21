@@ -142,6 +142,7 @@ class Attacher:
         self.fix = {}
         self.native_hint = ""
         self.logged = 0
+        self.waiting = None         # the set-up command being waited for, named in the log if the browser never answers
 
     def log(self, text: str) -> None:
         self.logged += 1
@@ -180,9 +181,11 @@ class Attacher:
     def call(self, method, sid=None, **params):
         """Send and wait for the answer (set-up only); events that arrive meanwhile are handled as usual."""
         box = []
+        self.waiting = method
         self.send(method, sid, then=box.append, **params)
         while not box:
             self.step()
+        self.waiting = None
         if "error" in box[0]:
             raise RuntimeError(f"{method}: {box[0]['error']}")
         return box[0].get("result", {})
@@ -306,7 +309,8 @@ def main() -> int:
     except EOFError:
         return 0                    # the browser is gone: so are we
     except (OSError, RuntimeError, ValueError, KeyError) as exc:
-        attacher.log(f"stopped: {type(exc).__name__}: {exc}")
+        where = f" waiting for {attacher.waiting}" if attacher.waiting else f" with {attacher.busy} targets not released"
+        attacher.log(f"stopped: {type(exc).__name__}: {exc}{where}")
         return 1
 
 
